@@ -53,6 +53,22 @@ func (r *Resolver) Resolve(intent Intent) (*Resolution, error) {
 }
 
 func (r *Resolver) resolveRename(intent Intent) (*Resolution, error) {
+	baseName := SymbolBaseName(intent.Target)
+	isMethod := strings.Contains(intent.Target, ".")
+
+	// Fast path: if the basename is rare across AID files, skip the semantic
+	// graph and grep the entire source tree. Names like "GetBundleByName" appear
+	// on at most a few types (real + mocks) — a full-tree grep is safe and fast.
+	// Only skip this for truly ambiguous names (Close, Get, Flush) that appear
+	// on many unrelated types where grep would cause false positives.
+	if isMethod && intent.AidDir != "" {
+		count := countAidSymbolsByBaseName(intent.AidDir, baseName)
+		if count <= 5 {
+			// Rare name — use fast grep path instead of scoped graph traversal
+			return r.resolveRenameUnique(intent, baseName)
+		}
+	}
+
 	// Determine the right cartograph command based on whether target looks like
 	// a type, function, or field.
 	nodes, err := r.findSymbolNodes(intent)
@@ -91,9 +107,74 @@ func (r *Resolver) resolveRename(intent Intent) (*Resolution, error) {
 	}
 
 	// Map nodes to source locations via grep
-	locations, warnings := r.locateAll(allNodes, intent.SourceDir, intent.AidDir, SymbolBaseName(intent.Target), intent.Target)
+	locations, warnings := r.locateAll(allNodes, intent.SourceDir, intent.AidDir, baseName, intent.Target)
 
 	return buildResolution(intent, primary, locations, warnings), nil
+}
+
+// resolveRenameUnique handles renames for symbols with unique basenames.
+// Instead of scoped graph traversal, it greps the entire source tree — faster
+// when there's no disambiguation needed. Skips cartograph entirely.
+func (r *Resolver) resolveRenameUnique(intent Intent, baseName string) (*Resolution, error) {
+	// Get the primary node from AID files directly — no cartograph needed.
+	// We already know the symbol exists (countAidSymbolsByBaseName found it).
+	primary, err := scanAidFilesForSymbol(intent.AidDir, intent.Target)
+	if err != nil {
+		// Shouldn't happen since countAidSymbolsByBaseName found it, but fallback
+		primary = &GraphNode{
+			Name:          baseName,
+			QualifiedName: intent.Target,
+			Kind:          "Method",
+		}
+	}
+
+	// Grep the entire source tree for the basename
+	locations := grepSymbol(intent.SourceDir, baseName)
+
+	// Also add the definition location from the primary node
+	defLocs := FindSourceLocations(*primary, intent.SourceDir, intent.AidDir, baseName)
+	locations = append(locations, defLocs...)
+
+	locations = deduplicateLocations(locations)
+	sortLocations(locations)
+
+	var warnings []string
+	if len(locations) == 0 {
+		warnings = append(warnings, fmt.Sprintf("no source locations found for %q", baseName))
+	}
+
+	return buildResolution(intent, *primary, locations, warnings), nil
+}
+
+// countAidSymbolsByBaseName counts how many @fn entries in AID files have
+// methods with the given basename. Used to detect unique names that don't
+// need semantic disambiguation.
+func countAidSymbolsByBaseName(aidDir, baseName string) int {
+	files, err := filepath.Glob(filepath.Join(aidDir, "*.aid"))
+	if err != nil {
+		return 0
+	}
+
+	count := 0
+	// Match @fn lines where the function name ends with ".baseName"
+	// e.g., for baseName="Close": matches "WALManager.Close", "BTreeIndex.Close", etc.
+	suffix := "." + baseName
+	for _, file := range files {
+		content, err := os.ReadFile(file)
+		if err != nil {
+			continue
+		}
+		for _, line := range strings.Split(string(content), "\n") {
+			trimmed := strings.TrimSpace(line)
+			if strings.HasPrefix(trimmed, "@fn ") {
+				fnName := strings.TrimPrefix(trimmed, "@fn ")
+				if strings.HasSuffix(fnName, suffix) || fnName == baseName {
+					count++
+				}
+			}
+		}
+	}
+	return count
 }
 
 func (r *Resolver) resolveMove(intent Intent) (*Resolution, error) {
@@ -435,10 +516,11 @@ func grepSymbol(sourceDir, symbolName string) []Location {
 		return nil
 	}
 
-	// Use grep -rn for recursive line-numbered search
+	// Use grep -rn for recursive line-numbered search on source files only.
+	// --include="*.go" prevents scanning binary files, data, and logs.
 	// No -w flag: we need substring matches to catch derivative symbols
 	// (e.g., GetDocumentPage must also match GetDocumentPageReadOnly)
-	cmd := exec.Command("grep", "-rn", symbolName, sourceDir)
+	cmd := exec.Command("grep", "-rn", "--include=*.go", symbolName, sourceDir)
 	output, err := cmd.Output()
 	if err != nil {
 		// grep returns exit code 1 for "no matches" — that's not an error
