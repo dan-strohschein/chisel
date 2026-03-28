@@ -39,6 +39,7 @@ type Resolution struct {
 	AffectedFiles   []string
 	AffectedModules []string
 	Warnings        []string
+	FastPath        bool // True when resolved via grep (rare name), no type disambiguation needed
 }
 
 // GraphNode is a code entity from cartograph's JSON output.

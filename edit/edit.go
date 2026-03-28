@@ -91,7 +91,12 @@ func GenerateRenameEdits(resolution *resolve.Resolution, newName string) ([]Edit
 		// 1. The target type's method definition (func (x *WALManager) Close)
 		// 2. Call sites where the method is called (e.g., obj.Close())
 		// Exclude other types' method definitions (func (x *OtherType) Close)
-		if isMethodRename {
+		//
+		// Skip this filter on fast-path resolutions — the name is rare enough
+		// that ScopeMatch's word-boundary check is sufficient. The type-based
+		// heuristic rejects valid references when variables don't match the
+		// type name (e.g., receiver "s" for BundleService).
+		if isMethodRename && !resolution.FastPath {
 			if !isMethodRenameCandidate(context, oldName, typeName, loc, defFile, defLine) {
 				continue
 			}

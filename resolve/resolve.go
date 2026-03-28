@@ -143,7 +143,9 @@ func (r *Resolver) resolveRenameUnique(intent Intent, baseName string) (*Resolut
 		warnings = append(warnings, fmt.Sprintf("no source locations found for %q", baseName))
 	}
 
-	return buildResolution(intent, *primary, locations, warnings), nil
+	res := buildResolution(intent, *primary, locations, warnings)
+	res.FastPath = true
+	return res, nil
 }
 
 // countAidSymbolsByBaseName counts how many @fn entries in AID files have
