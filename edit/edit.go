@@ -142,9 +142,57 @@ func isMethodRenameCandidate(line, methodName, typeName string, loc resolve.Loca
 		return false
 	}
 
-	// For lines in caller files, allow them — they were found via scoped grep
-	// in files that cartograph identified as callers
-	return true
+	// For lines in caller files, check if the method call is plausibly on a
+	// variable of the target type. This prevents renaming brinIdx.Flush()
+	// when we only want hashIndex.Flush().
+	//
+	// Heuristic: look for the method call pattern ".<method>(" on the line,
+	// and check if the variable name before the dot contains the type name
+	// (case-insensitive). E.g., for typeName="HashIndexV3":
+	//   hashIndex.Flush() → matches (hashIndex contains "hashindex")
+	//   idx.Flush() → doesn't match (too ambiguous — skip to be safe)
+	//   brinIdx.Flush() → doesn't match (brinidx doesn't contain "hashindex")
+	lowerType := strings.ToLower(typeName)
+	lowerLine := strings.ToLower(trimmed)
+
+	// Find ".Method(" pattern
+	callPattern := "." + strings.ToLower(methodName)
+	callIdx := strings.Index(lowerLine, callPattern)
+	if callIdx <= 0 {
+		return false
+	}
+
+	// Extract the variable name before the dot
+	prefix := lowerLine[:callIdx]
+	// Walk backwards to find the start of the variable name
+	varStart := callIdx - 1
+	for varStart >= 0 {
+		ch := prefix[varStart]
+		if (ch >= 'a' && ch <= 'z') || (ch >= '0' && ch <= '9') || ch == '_' {
+			varStart--
+		} else {
+			break
+		}
+	}
+	varStart++
+	varName := prefix[varStart:callIdx]
+
+	// Check if variable name relates to the type name.
+	// For type "HashIndexV3" and variable "hashIndex":
+	//   lowerType = "hashindexv3", varName = "hashindex"
+	// We check both directions: type contains var OR var contains type prefix
+	if strings.Contains(lowerType, varName) || strings.Contains(varName, lowerType) {
+		return true
+	}
+
+	// Also check without version suffixes: "hashindexv3" → "hashindex"
+	// Strip trailing digits from the type name
+	trimmedType := strings.TrimRight(lowerType, "0123456789")
+	if len(trimmedType) > 2 && (strings.Contains(trimmedType, varName) || strings.Contains(varName, trimmedType)) {
+		return true
+	}
+
+	return false
 }
 
 // GenerateMoveEdits generates edits for a move operation.
@@ -208,7 +256,13 @@ func GeneratePropagateEdits(resolution *resolve.Resolution, errorType string) ([
 		defFile = resolve.ResolveSourceFile(defFile, resolution.Intent.SourceDir, resolution.Intent.AidDir)
 	}
 
+	// First pass: check if the target function's signature needs modification.
+	// If it already returns the error type, there's nothing to propagate.
+	sigModified := false
 	for _, loc := range resolution.Locations {
+		if loc.SymbolKind != "definition" || loc.File != defFile || loc.Line != defLine {
+			continue
+		}
 		context := loc.Context
 		if context == "" {
 			line, err := ReadLineFromFile(loc.File, loc.Line)
@@ -217,24 +271,38 @@ func GeneratePropagateEdits(resolution *resolve.Resolution, errorType string) ([
 			}
 			context = line
 		}
-
-		switch loc.SymbolKind {
-		case "definition":
-			// Only modify the TARGET function's signature, not callers'
-			if loc.File == defFile && loc.Line == defLine {
-				edit, err := generateSignatureEdit(loc, context, errorType)
-				if err == nil {
-					edits = append(edits, edit)
-				}
-				// Also generate edits for return statements in the function body
-				returnEdits := generateReturnEdits(loc, errorType)
-				edits = append(edits, returnEdits...)
-			}
-		case "call", "reference":
-			// Wrap call site with error handling
-			callEdits := generateCallSiteEdits(loc, context, resolution.Intent.Target, errorType)
-			edits = append(edits, callEdits...)
+		edit, err := generateSignatureEdit(loc, context, errorType)
+		if err == nil {
+			edits = append(edits, edit)
+			sigModified = true
+			// Also generate edits for return statements in the function body
+			returnEdits := generateReturnEdits(loc, errorType)
+			edits = append(edits, returnEdits...)
 		}
+		break
+	}
+
+	// If the signature wasn't modified (already returns error), skip call site edits.
+	// The callers already handle the error return.
+	if !sigModified {
+		return edits, nil
+	}
+
+	// Second pass: wrap call sites with error handling
+	for _, loc := range resolution.Locations {
+		if loc.SymbolKind != "call" && loc.SymbolKind != "reference" {
+			continue
+		}
+		context := loc.Context
+		if context == "" {
+			line, err := ReadLineFromFile(loc.File, loc.Line)
+			if err != nil {
+				continue
+			}
+			context = line
+		}
+		callEdits := generateCallSiteEdits(loc, context, resolution.Intent.Target, errorType)
+		edits = append(edits, callEdits...)
 	}
 
 	return edits, nil
@@ -313,6 +381,11 @@ func generateSignatureEdit(loc resolve.Location, line, errorType string) (Edit, 
 	// Remove the opening brace if present
 	afterParams = strings.TrimSuffix(strings.TrimSpace(afterParams), "{")
 	afterParams = strings.TrimSpace(afterParams)
+
+	// If the return type already includes the error type, skip modification
+	if strings.Contains(afterParams, errorType) {
+		return Edit{}, fmt.Errorf("function already returns %s: %s", errorType, trimmed)
+	}
 
 	var oldSig, newSig string
 	if afterParams == "" {
@@ -513,8 +586,10 @@ func GenerateAidEdits(resolution *resolve.Resolution, sourceEdits []Edit) []Edit
 
 				// Update @fn/@type name declarations
 				// AID uses qualified names: "@fn WALManager.Close"
-				if strings.HasPrefix(trimmed, "@fn "+oldTarget) ||
-					strings.HasPrefix(trimmed, "@type "+oldTarget) {
+				// Use exact match (not prefix) to avoid matching
+				// "@fn BundleService.GetDocumentPageReadOnly" when renaming
+				// "BundleService.GetDocumentPage"
+				if trimmed == "@fn "+oldTarget || trimmed == "@type "+oldTarget {
 					edits = append(edits, Edit{
 						File:    aidFile,
 						Line:    i + 1,
@@ -522,8 +597,7 @@ func GenerateAidEdits(resolution *resolve.Resolution, sourceEdits []Edit) []Edit
 						NewText: newTarget,
 						Kind:    AidUpdate,
 					})
-				} else if strings.HasPrefix(trimmed, "@fn "+oldBaseName) ||
-					strings.HasPrefix(trimmed, "@type "+oldBaseName) {
+				} else if trimmed == "@fn "+oldBaseName || trimmed == "@type "+oldBaseName {
 					// Unqualified form: "@fn Close"
 					edits = append(edits, Edit{
 						File:    aidFile,
@@ -575,6 +649,17 @@ func ScopeMatch(line, symbol, lang string, includeComments bool) bool {
 	idx := strings.Index(line, symbol)
 	if idx < 0 {
 		return false
+	}
+
+	// Word boundary check: the character after the symbol must not be
+	// alphanumeric or underscore. This prevents "GetDocumentPage" from
+	// matching inside "GetDocumentPageReadOnly".
+	afterIdx := idx + len(symbol)
+	if afterIdx < len(line) {
+		ch := line[afterIdx]
+		if (ch >= 'a' && ch <= 'z') || (ch >= 'A' && ch <= 'Z') || (ch >= '0' && ch <= '9') || ch == '_' {
+			return false
+		}
 	}
 
 	// Check if inside a single-line comment
