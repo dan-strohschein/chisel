@@ -1,0 +1,142 @@
+@module chisel/edit
+@lang go
+@version 0.1.0
+@purpose Generates precise text edits from resolved locations — transforms refactoring intents into concrete file changes
+@depends [chisel/resolve]
+
+---
+
+@type Edit
+@kind struct
+@purpose A single text edit to apply to a source file.
+@fields
+  File: str — Absolute path to the file being edited
+  Line: int — Line number where the edit starts (1-based)
+  OldText: str — The exact text to find and replace on this line
+  NewText: str — The replacement text
+  Kind: EditKind — What type of edit this is (for reporting and ordering)
+
+---
+
+@type EditKind
+@kind enum
+@purpose Classifies edits for ordering and reporting.
+@variants
+  | SymbolRename — Direct rename of a symbol occurrence
+  | ImportUpdate — Update an import path
+  | ImportAdd — Add a new import statement
+  | ImportRemove — Remove an import statement
+  | SignatureChange — Modify a function signature (e.g., add error return)
+  | CallSiteUpdate — Update a function call (e.g., add error handling)
+  | TypeReference — Update a type reference in a declaration or annotation
+  | AidUpdate — Update an AID file to reflect the refactoring
+
+---
+
+@type EditSet
+@kind struct
+@purpose A complete set of edits for one refactoring operation, grouped by file.
+@fields
+  Intent: resolve.Intent — The original refactoring intent
+  Edits: [Edit] — All edits, sorted by file then line (descending) for safe application
+  FileCount: int — Number of files affected
+  EditCount: int — Total number of individual edits
+  AidEdits: [Edit] — Edits to AID files (tracked separately — applied after source edits)
+
+---
+
+@fn GenerateEdits
+@purpose Takes a Resolution and produces the complete set of text edits to apply.
+@sig (resolution: resolve.Resolution) -> EditSet? ! error
+@params
+  resolution: The resolved locations from the resolve phase
+@returns EditSet containing all edits needed to complete the refactoring
+@errors
+  error — source file unreadable, or edit generation failed for a location
+@post Edits within each file are sorted by line number descending so they can be applied top-to-bottom without shifting line numbers.
+
+---
+
+@fn GenerateRenameEdits
+@purpose Generate edits for a rename operation.
+@sig (resolution: resolve.Resolution, newName: str) -> [Edit]
+@params
+  resolution: Resolved locations of the symbol
+  newName: The new name for the symbol
+@returns Edits replacing the old name with the new name at each location
+@post For method renames (e.g., "Type.Method"), generates separate edits for the type part and method part depending on context. A call site `obj.Method()` only renames `Method`, not the receiver variable.
+
+---
+
+@fn GenerateMoveEdits
+@purpose Generate edits for a move operation.
+@sig (resolution: resolve.Resolution, destination: str) -> [Edit]
+@params
+  resolution: Resolved locations of the symbol and its references
+  destination: Target package path
+@returns Edits that: (1) update import statements from old package to new, (2) update qualified references, (3) mark the definition for relocation
+@post Does NOT physically move the file — that's the patcher's job. Generates edits that assume the symbol will be in the destination package.
+
+---
+
+@fn GeneratePropagateEdits
+@purpose Generate edits to add error propagation through a call chain.
+@sig (resolution: resolve.Resolution, errorType: str) -> [Edit]
+@params
+  resolution: Resolved function and all its callers
+  errorType: The error type being added (e.g., "error", "ValidationError")
+@returns Edits that: (1) add error return to the target function's signature, (2) wrap each call site with error handling
+@post For Go: changes `func Foo() Result` to `func Foo() (Result, error)` and wraps callers with `result, err := Foo(); if err != nil { return ..., err }`. The exact pattern depends on @lang from AID.
+
+---
+
+@fn GenerateAidEdits
+@purpose Generate edits to update AID files to reflect the refactoring.
+@sig (resolution: resolve.Resolution, sourceEdits: [Edit]) -> [Edit]
+@params
+  resolution: The resolved refactoring
+  sourceEdits: The source code edits being applied (for context)
+@returns Edits to AID files — renamed @fn/@type entries, updated @sig fields, updated @related references
+@post AID edits are applied after source edits succeed. If source edits fail, AID files are left unchanged.
+
+---
+
+@fn ReadLineFromFile
+@purpose Read a specific line from a source file for edit context.
+@sig (file: str, line: int) -> str? ! error
+@effects Fs
+
+---
+
+@fn ScopeMatch
+@purpose Check if a symbol occurrence on a line is a real reference (not inside a string or comment).
+@sig (line: str, symbol: str, lang: str) -> bool
+@params
+  line: The source line to check
+  symbol: The symbol name to look for
+  lang: Programming language (from AID @lang) — determines comment/string syntax
+@returns true if the symbol appears in a code context, false if it's inside a string literal or comment
+@post Handles: single-line strings, double-quoted strings, single-line comments (// and #), block comment indicators. Does NOT handle multi-line strings or block comments spanning previous lines — those are edge cases accepted as limitations in v0.1.
+
+---
+
+@decision edit_ordering
+@purpose How to order edits within a file to avoid line number drift
+@chosen Sort edits by line number descending. Apply from bottom to top.
+@rejected Track line offsets and adjust, apply top-to-bottom with offset accumulator
+@rationale Bottom-to-top application means earlier edits don't shift the line numbers of later edits. Simpler and less error-prone than tracking offsets. Standard practice in code modification tools.
+
+---
+
+@decision scope_filtering
+@purpose How to avoid renaming symbols inside strings and comments
+@chosen Per-line heuristic: check if the symbol appears outside of quote pairs and after comment markers
+@rejected Full AST parsing (language-specific, heavyweight), no filtering (too dangerous)
+@rationale A line-level heuristic catches 95%+ of false positives with zero language-specific dependencies. The remaining edge cases (multi-line strings, heredocs) are rare enough to accept as v0.1 limitations. Users can review edits in dry-run mode before applying.
+
+---
+
+@antipatterns
+  - Don't apply edits during generation. Edit generation is pure — it returns data, not side effects.
+  - Don't assume one edit per location. A move operation generates both an import edit and a reference edit for the same file.
+  - Don't edit AID files if source edits haven't been confirmed. AID edits are a separate phase.

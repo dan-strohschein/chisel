@@ -1,0 +1,193 @@
+@module chisel/resolve
+@lang go
+@version 0.1.0
+@purpose Resolves refactoring intents into affected code locations by shelling out to the cartograph CLI and using grep for source discovery
+@depends [cartograph CLI (binary on PATH), aidkit/parser]
+
+---
+
+@type Intent
+@kind struct
+@purpose A parsed refactoring request — what the user wants to do.
+@fields
+  Kind: RefactorKind — What type of refactoring operation
+  Target: str — The symbol to refactor (e.g., "QueryEngine", "HttpClient.Get", "User.email")
+  NewName: str — For rename: the new name. Empty for other operations.
+  Destination: str — For move: the target package. Empty for other operations.
+  ErrorType: str — For propagate: the error type to add. Empty for other operations.
+  AidDir: str — Path to .aidocs/ directory
+  SourceDir: str — Path to source tree (for edit generation)
+
+---
+
+@type RefactorKind
+@kind enum
+@purpose The type of refactoring operation.
+@variants
+  | Rename — Rename a symbol (type, function, method, field, constant) across the codebase
+  | Move — Move a symbol to a different package, updating all references
+  | Propagate — Add an error return to a function and propagate through all callers
+
+---
+
+@type Location
+@kind struct
+@purpose A specific occurrence of a symbol in a source file.
+@fields
+  File: str — Absolute path to the source file
+  Line: int — Line number (1-based)
+  Column: int — Column number (1-based, 0 if unknown)
+  EndColumn: int — End column (0 if unknown, meaning whole-word match)
+  SymbolKind: str — What this occurrence is: "definition", "call", "type_ref", "field_ref", "import"
+  Context: str — The full line of source code containing this occurrence
+
+---
+
+@type GraphNode
+@kind struct
+@purpose A code entity from cartograph's JSON output — lightweight mirror, not an import.
+@fields
+  Name: str — Symbol name (e.g., "QueryEngine")
+  QualifiedName: str — Fully qualified name (e.g., "cartograph/query.QueryEngine")
+  Kind: str — Entity kind: "Function", "Method", "Type", "Field", etc.
+  Module: str — AID module this belongs to
+  SourceFile: str — Source file path from [src:] refs (may be empty)
+  SourceLine: int — Source line from [src:] refs (may be 0)
+
+---
+
+@type GraphResult
+@kind struct
+@purpose Parsed JSON output from a cartograph CLI query.
+@fields
+  Query: str — The query that produced this result
+  Summary: str — Human-readable summary
+  NodeCount: int — Total unique nodes
+  MaxDepth: int — Deepest traversal path
+  Paths: [GraphPath] — Traversal paths through the graph
+
+---
+
+@type GraphPath
+@kind struct
+@purpose A single traversal path from cartograph output.
+@fields
+  Nodes: [GraphNode] — Nodes along the path
+  Edges: [GraphEdge] — Edges connecting the nodes
+  Depth: int — How deep this path goes
+
+---
+
+@type GraphEdge
+@kind struct
+@purpose An edge from cartograph's JSON output.
+@fields
+  Source: str — Source node ID
+  Target: str — Target node ID
+  Kind: str — Edge kind: "Calls", "Returns", "HasField", etc.
+  Label: str — Optional label
+
+---
+
+@type Resolution
+@kind struct
+@purpose The result of resolving an intent — all locations that need to change.
+@fields
+  Intent: Intent — The original refactoring intent
+  Symbol: GraphNode — The primary node being refactored (from cartograph output)
+  Locations: [Location] — Every source location that needs editing, sorted by file then line
+  AffectedFiles: [str] — Deduplicated list of files that will be modified
+  AffectedModules: [str] — AID modules containing affected symbols
+  Warnings: [str] — Non-fatal issues (e.g., "3 references could not be resolved to source locations")
+
+---
+
+@fn Resolve
+@purpose Takes a refactoring intent and returns all affected locations in the codebase.
+@sig (intent: Intent) -> Resolution? ! error
+@params
+  intent: The parsed refactoring request
+@returns Resolution containing every source location that needs editing
+@errors
+  NotFoundError — target symbol not found by cartograph
+  AmbiguousError — target matches multiple symbols (user must qualify the name)
+  NoSourceError — symbol found in AID but no [src:] references to map to source locations
+@post Locations are sorted by file path, then line number. No duplicates.
+
+---
+
+@fn RunCartograph
+@purpose Shell out to the cartograph CLI binary and parse the JSON result.
+@sig (command: str, args: [str], aidDir: str) -> GraphResult? ! error
+@params
+  command: The cartograph subcommand (e.g., "callstack", "depends", "field")
+  args: Positional and flag arguments (e.g., ["QueryEngine", "--up"])
+  aidDir: Path to .aidocs/ directory — passed as --dir flag
+@returns Parsed JSON output from cartograph
+@effects Process (exec.Command)
+@post Always passes --format json. Captures stderr for error messages. Returns structured error if cartograph exits non-zero.
+
+---
+
+@fn ResolveRename
+@purpose Resolve a rename intent — find every reference to the symbol across the codebase.
+@sig (intent: Intent) -> [Location] ! error
+@params
+  intent: The rename intent with target symbol name
+@returns All source locations where the symbol name appears in a relevant context
+@post Uses "cartograph depends <symbol>" to find all functions that reference the type, or "cartograph callstack <symbol> --both" to find callers/callees. Then uses grep to locate exact source positions. Filters out occurrences in strings and comments.
+
+---
+
+@fn ResolveMove
+@purpose Resolve a move intent — find the symbol definition and all references, plus import statements.
+@sig (intent: Intent) -> [Location] ! error
+@params
+  intent: The move intent with target symbol and destination package
+@returns Locations including the definition site, all call sites, and all import statements for the source package
+@post Uses "cartograph depends <symbol>" to find all dependents. Then uses grep to locate import statements and references in source.
+
+---
+
+@fn ResolvePropagate
+@purpose Resolve an error propagation intent — find the function and all its callers up the call chain.
+@sig (intent: Intent) -> [Location] ! error
+@params
+  intent: The propagate intent with target function and error type
+@returns Locations of the function signature and every caller's call site (callers need error handling added)
+@post Uses "cartograph callstack <function> --up" to walk the caller chain. Each caller in the chain needs its call site located via grep.
+
+---
+
+@fn FindSourceLocations
+@purpose Maps a graph node to actual source file locations using [src:] references and grep.
+@sig (node: GraphNode, sourceDir: str, symbolName: str) -> [Location]
+@params
+  node: The graph node from cartograph output, with optional SourceFile/SourceLine
+  sourceDir: Path to search for additional occurrences
+  symbolName: The exact symbol name to search for
+@returns All source locations where this symbol appears
+@post If the node has SourceFile/SourceLine from cartograph, those are used as primary. Grep is used as fallback and for discovering call sites not captured in AID.
+
+---
+
+@decision resolve_strategy
+@purpose How to find source locations from AID data
+@chosen Hybrid: cartograph CLI for semantic graph queries, grep for exact source positions
+@rejected Import cartograph as Go library (all packages are internal/, can't import), Pure grep (noisy — matches strings and comments), Build our own graph (duplicates cartograph)
+@rationale Cartograph is a CLI tool with well-structured JSON output. Shelling out to it keeps chisel decoupled — no Go import dependency, works with any cartograph version, and the JSON contract is stable. Cartograph tells us WHAT symbols are related; grep tells us WHERE they appear in source files.
+
+---
+
+@decision disambiguation
+@purpose How to handle ambiguous symbol names
+@chosen Fail with AmbiguousError listing all candidates. User must qualify the name.
+@rejected Auto-pick the most likely candidate, interactive disambiguation prompt
+@rationale A refactoring tool that guesses wrong is worse than one that asks. CLI agents can re-invoke with the qualified name. The error message includes all candidates so the agent or user can choose.
+
+---
+
+@antipatterns
+  - Don't modify any files during resolution. Resolve is purely read-only. All writes happen in the edit/patch phases.
+  - Don't assume AID is complete. Grep-based fallback is essential because AID may not have [src:] refs for every occurrence.
+  - Don't resolve across project boundaries. Only resolve within the source tree specified by sourceDir.

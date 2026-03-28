@@ -1,0 +1,11 @@
+@manifest
+@project TestProject
+@aid_version 0.1
+@lang go
+
+---
+
+@package testpkg
+@aid_file testpkg.aid
+@purpose Test package for chisel tests
+@layer skeleton

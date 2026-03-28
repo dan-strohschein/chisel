@@ -1,0 +1,48 @@
+@manifest
+@project Chisel
+@aid_version 0.1
+@lang go
+@shape
+  Entry point: cmd/chisel (CLI)
+  Data flow: CLI intent → resolver (AID+Cartograph) → editor (generate edits) → patcher (apply/output)
+  Key types: Intent, RefactorKind, Location, Edit, Patch, Resolution
+  Boundaries: resolve (read-only graph queries), edit (pure transform), patch (file I/O)
+  Dependencies: cartograph CLI (graph queries via shell), aidkit/parser (AID file parsing)
+@entry_points [cmd/chisel]
+@key_types [Intent, RefactorKind, Location, Edit, Patch, Resolution, GraphNode, GraphResult]
+
+---
+
+@package chisel/resolve
+@aid_file resolve.aid
+@depends [cartograph CLI, aidkit/parser]
+@purpose Resolves a refactoring intent into a set of affected code locations by shelling out to cartograph CLI and grep
+@layer skeleton
+@key_risks symbol disambiguation (multiple symbols with same name), cross-module resolution, stale AID vs current source
+
+---
+
+@package chisel/edit
+@aid_file edit.aid
+@depends [chisel/resolve]
+@purpose Generates precise text edits from resolved locations — the core refactoring logic
+@layer skeleton
+@key_risks edit ordering (overlapping edits in same file), scope-aware replacement (not replacing in strings/comments), preserving formatting
+
+---
+
+@package chisel/patch
+@aid_file patch.aid
+@depends [chisel/edit]
+@purpose Applies edits to files or outputs as unified diff for review
+@layer skeleton
+@key_risks atomic application (all-or-nothing), backup/rollback, line number drift when applying multiple edits to same file
+
+---
+
+@package chisel/cli
+@aid_file cli.aid
+@depends [chisel/resolve, chisel/edit, chisel/patch]
+@purpose CLI interface — 3 core commands: rename, move, propagate
+@layer skeleton
+@key_risks clear error messages for ambiguous symbols, dry-run must be default for safety

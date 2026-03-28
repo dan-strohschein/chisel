@@ -1,0 +1,73 @@
+@module chisel/cli
+@lang go
+@version 0.1.0
+@purpose CLI interface for semantic refactoring — 3 core commands powered by AID + Cartograph
+@depends [chisel/resolve, chisel/edit, chisel/patch]
+
+---
+
+@fn main
+@purpose Entry point. Parses CLI args, runs refactoring pipeline: resolve → edit → patch.
+@sig () -> None
+@params
+  Global flags:
+    --dir: Path to .aidocs/ directory. Default: auto-discover via walk-up.
+    --src: Path to source tree. Default: parent of .aidocs/ directory.
+    --apply: Actually modify files. Default: dry-run (preview only).
+    --backup: Create .bak files before modifying. Only used with --apply.
+    --format: Output format for dry-run. One of: unified (default), json, summary.
+
+---
+
+@workflow cli_usage
+@purpose How the CLI is invoked for each refactoring operation
+@steps
+  1. chisel rename <old> <new> — Rename a symbol across the codebase
+     Example: chisel rename QueryEngine GraphQueryEngine
+     Example: chisel rename HttpClient.Get HttpClient.Fetch
+     Example: chisel rename User.email User.emailAddress
+  2. chisel move <symbol> <destination-package> — Move a symbol to another package
+     Example: chisel move ValidateEmail validation
+     Example: chisel move HttpClient pkg/client
+  3. chisel propagate <function> <error-type> — Add error return and propagate through callers
+     Example: chisel propagate ProcessRequest ValidationError
+     Example: chisel propagate SaveDocument error
+
+---
+
+@workflow refactoring_pipeline
+@purpose How every refactoring command executes internally
+@steps
+  1. Parse: CLI args → Intent struct (kind, target, options)
+  2. Load: read AID files from --dir, build Cartograph graph
+  3. Resolve: query graph for all references to the target symbol → Resolution
+  4. Edit: generate text edits from resolved locations → EditSet
+  5. Patch: if --apply, modify files; otherwise, output diff for review
+  6. AID update: if source edits succeeded and --apply, update AID files to match
+@antipatterns
+  - Don't skip the resolve phase. Even for "simple" renames, the graph finds references that grep would miss.
+  - Don't apply without showing the diff first. If --apply is set, still log the diff to stderr before applying.
+  - Don't update AID before source. If source edits fail, AID must remain unchanged.
+
+---
+
+@decision default_safety
+@purpose Protect users from unintended changes
+@chosen Three safety layers: (1) dry-run by default, (2) diff always shown, (3) --backup available
+@rejected Single confirmation prompt (doesn't work for AI agents), no safety (too dangerous)
+@rationale AI agents invoke CLI tools programmatically. A "are you sure?" prompt would block the agent. Instead, the default mode is read-only (dry-run), the diff is always visible, and the agent can make an informed decision to pass --apply after reviewing the output. This design works for both human and AI users.
+
+---
+
+@decision output_format
+@purpose How refactoring results are displayed
+@chosen Unified diff by default. JSON for programmatic consumption. Summary for quick checks.
+@rejected Custom tree format (diffs are the universal language of code changes)
+@rationale Developers and AI agents both understand unified diffs. Diffs can be piped to `git apply`, reviewed in any editor, or parsed programmatically. JSON output enables AI agents to inspect individual edits before deciding to apply.
+
+---
+
+@antipatterns
+  - Don't parse source code with a language-specific parser. Chisel works through AID + Cartograph + grep, not ASTs. Language-agnostic by design.
+  - Don't assume all references are in AID. Grep-based fallback catches call sites and references that AID's [src:] didn't capture.
+  - Don't buffer the entire source tree. Load files on demand during the edit phase, not upfront.

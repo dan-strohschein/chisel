@@ -1,0 +1,100 @@
+@module chisel/patch
+@lang go
+@version 0.1.0
+@purpose Applies edits to source files or outputs as unified diff for review
+@depends [chisel/edit]
+
+---
+
+@type Patch
+@kind struct
+@purpose The result of applying or previewing an EditSet.
+@fields
+  FilesModified: int — Number of source files changed
+  EditsApplied: int — Number of individual edits applied
+  AidFilesModified: int — Number of AID files updated
+  DryRun: bool — Whether this was a preview (no files changed)
+  Diff: str — Unified diff output (always populated, even when applying)
+  Errors: [str] — Any errors encountered during application (partial apply possible)
+
+---
+
+@type PatchOptions
+@kind struct
+@purpose Controls how edits are applied.
+@fields
+  DryRun: bool — If true, generate diff but don't modify files. Default: true (safety first).
+  UpdateAid: bool — If true, also apply AID file edits after source edits succeed. Default: true.
+  BackupSuffix: str — If non-empty, create backup files with this suffix before editing (e.g., ".bak"). Default: empty (no backups).
+  OutputFormat: str — "unified" (default), "json", or "summary"
+
+---
+
+@fn Apply
+@purpose Apply an EditSet to the filesystem, or preview as a diff.
+@sig (editSet: edit.EditSet, options: PatchOptions) -> Patch? ! error
+@params
+  editSet: The complete set of edits from the edit phase
+  options: Controls dry-run, backup, output format
+@returns Patch result with diff output and statistics
+@errors
+  error — file not writable, backup failed, or edit application failed
+@effects Fs
+@post If DryRun is true, no files are modified — only the diff is generated. If DryRun is false, source edits are applied first, then AID edits (if UpdateAid is true). On any error, already-applied edits are NOT rolled back (use backups for safety).
+
+---
+
+@fn ApplyToFile
+@purpose Apply all edits for a single file.
+@sig (file: str, edits: [edit.Edit], dryRun: bool) -> str? ! error
+@params
+  file: Path to the file
+  edits: Edits for this file, sorted by line descending
+  dryRun: If true, return the modified content without writing
+@returns The unified diff for this file
+@effects Fs
+@post Reads the file, applies edits bottom-to-top, writes the result (unless dryRun). Returns the diff between original and modified content.
+
+---
+
+@fn GenerateDiff
+@purpose Generate a unified diff between original and modified file content.
+@sig (file: str, original: str, modified: str) -> str
+@params
+  file: File path (used in diff header)
+  original: Original file content
+  modified: Modified file content
+@returns Unified diff string with --- / +++ / @@ headers
+
+---
+
+@fn FormatPatch
+@purpose Format a Patch result for display.
+@sig (patch: Patch, format: str) -> str
+@params
+  patch: The patch result
+  format: "unified" (full diff), "json" (structured), or "summary" (counts only)
+@returns Formatted output string
+
+---
+
+@decision dry_run_default
+@purpose Whether dry-run should be the default mode
+@chosen DryRun defaults to true. User must explicitly pass --apply to modify files.
+@rejected Default to apply (faster workflow), always dry-run (no way to apply from CLI)
+@rationale A refactoring tool that modifies files by default is dangerous. Especially when invoked by an AI agent that might misunderstand the intent. Dry-run lets the user or agent review the diff before committing. The --apply flag is an explicit opt-in to file modification.
+
+---
+
+@decision no_rollback
+@purpose Whether to support automatic rollback on partial failure
+@chosen No automatic rollback. Use --backup for safety.
+@rejected Git-based rollback (stash before, restore on failure), in-memory rollback
+@rationale Rollback is complex and creates a false sense of safety. Users should either: (1) use dry-run to verify before applying, (2) use --backup to create .bak files, or (3) rely on git — if you're refactoring without version control, that's a bigger problem than this tool can solve.
+
+---
+
+@antipatterns
+  - Don't apply AID edits if source edits failed. AID must stay in sync with the actual source.
+  - Don't buffer entire large files in memory. Read, apply edits, write — streaming where possible.
+  - Don't swallow errors. If one file fails, report it and continue with the rest. Return all errors in Patch.Errors.

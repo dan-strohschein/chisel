@@ -1,0 +1,32 @@
+@module testpkg
+@lang go
+@version 0.1.0
+@purpose Test package with some functions and types
+
+---
+
+@type QueryEngine
+@kind struct
+@purpose A query engine for testing renames
+@fields
+  maxDepth: int — Maximum traversal depth
+
+---
+
+@fn ProcessRequest
+@purpose Process a request
+@sig (req: Request) -> Response
+@calls [ValidateInput, SaveResult]
+
+---
+
+@fn ValidateInput
+@purpose Validate the input
+@sig (input: str) -> bool
+
+---
+
+@fn SaveResult
+@purpose Save a result to storage
+@sig (result: Response) -> None ! error
+@effects Fs
