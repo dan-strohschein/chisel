@@ -426,6 +426,13 @@ func (r *Resolver) locateAll(nodes []GraphNode, sourceDir, aidDir, symbolName, f
 		locations = append(locations, grepLocs...)
 	}
 
+	// Sweep test files for references. Cartograph's graph is built from AID
+	// files which typically don't cover test packages, so test call sites are
+	// invisible to the scoped grep above. A targeted grep of *_test.go files
+	// closes this gap without scanning the entire source tree.
+	testLocs := grepSymbolInTests(sourceDir, symbolName)
+	locations = append(locations, testLocs...)
+
 	// Deduplicate and sort
 	locations = deduplicateLocations(locations)
 	sortLocations(locations)
@@ -510,6 +517,23 @@ func grepSymbolInFile(file, symbolName string) []Location {
 		return nil
 	}
 	return parseGrepOutputSingleFile(string(output), file)
+}
+
+// grepSymbolInTests runs grep on test files to find test references.
+// AID skeletons typically don't cover test packages, so cartograph's graph
+// misses test call sites. This targeted sweep catches them without the cost
+// of a full source tree grep. Matches both *_test.go (standard) and *_tests.go
+// (non-standard but used in some projects).
+func grepSymbolInTests(sourceDir, symbolName string) []Location {
+	if sourceDir == "" || symbolName == "" {
+		return nil
+	}
+	cmd := exec.Command("grep", "-rn", "--include=*_test.go", "--include=*_tests.go", symbolName, sourceDir)
+	output, err := cmd.Output()
+	if err != nil {
+		return nil
+	}
+	return parseGrepOutput(string(output))
 }
 
 // grepSymbol runs grep to find all occurrences of a symbol in the source tree.

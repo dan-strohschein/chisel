@@ -197,6 +197,20 @@ func isMethodRenameCandidate(line, methodName, typeName string, loc resolve.Loca
 		return true
 	}
 
+	// Filename heuristic: if the filename contains the type name, this file
+	// is likely dedicated to that type (e.g., hashindex_compaction_e2e_test.go
+	// for HashIndexV3). Test files especially use short variable names like
+	// "idx" that don't match the type, but the filename makes the intent clear.
+	lowerFile := strings.ToLower(filepath.Base(loc.File))
+	// Strip version suffixes: "hashindexv3" → "hashindexv" → "hashindex"
+	coreType := strings.TrimRight(trimmedType, "v")
+	if len(coreType) < 3 {
+		coreType = trimmedType
+	}
+	if strings.Contains(lowerFile, coreType) || strings.Contains(lowerFile, lowerType) {
+		return true
+	}
+
 	return false
 }
 
