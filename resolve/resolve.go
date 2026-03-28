@@ -186,21 +186,106 @@ func (r *Resolver) findSymbolNodes(intent Intent) ([]GraphNode, error) {
 			if strings.Contains(intent.Target, ".") {
 				result, err = r.Graph.Query("field", []string{intent.Target}, intent.AidDir)
 				if err != nil {
-					return nil, &NotFoundError{Symbol: intent.Target}
+					// Fall through to AID file scan below
+					result = nil
 				}
-			} else {
-				return nil, &NotFoundError{Symbol: intent.Target}
 			}
 		}
 	}
 
-	if result == nil || len(result.Paths) == 0 {
-		return nil, &NotFoundError{Symbol: intent.Target}
+	if result != nil && len(result.Paths) > 0 {
+		// The first node in the first path is typically the target symbol
+		primary := result.Paths[0].Nodes[0]
+		return []GraphNode{primary}, nil
 	}
 
-	// The first node in the first path is typically the target symbol
-	primary := result.Paths[0].Nodes[0]
-	return []GraphNode{primary}, nil
+	// Fallback: scan AID files directly for @fn/@type definitions.
+	// This handles symbols that exist in AID but aren't reachable through
+	// cartograph's graph traversal (e.g., methods only called via interfaces).
+	node, err := scanAidFilesForSymbol(intent.AidDir, intent.Target)
+	if err != nil {
+		return nil, &NotFoundError{Symbol: intent.Target}
+	}
+	return []GraphNode{*node}, nil
+}
+
+// scanAidFilesForSymbol searches AID files directly for a symbol definition.
+// Looks for "@fn <name>" or "@type <name>" lines and extracts source location
+// from @source_file/@source_line annotations.
+func scanAidFilesForSymbol(aidDir, target string) (*GraphNode, error) {
+	if aidDir == "" {
+		return nil, fmt.Errorf("no AID directory")
+	}
+
+	files, err := filepath.Glob(filepath.Join(aidDir, "*.aid"))
+	if err != nil || len(files) == 0 {
+		return nil, fmt.Errorf("no AID files found in %s", aidDir)
+	}
+
+	baseName := SymbolBaseName(target)
+
+	for _, file := range files {
+		content, err := os.ReadFile(file)
+		if err != nil {
+			continue
+		}
+
+		lines := strings.Split(string(content), "\n")
+		var module string
+
+		for i, line := range lines {
+			trimmed := strings.TrimSpace(line)
+
+			// Track the module name
+			if strings.HasPrefix(trimmed, "@module ") {
+				module = strings.TrimPrefix(trimmed, "@module ")
+			}
+
+			// Check for exact @fn or @type match
+			if trimmed == "@fn "+target || trimmed == "@type "+target ||
+				trimmed == "@fn "+baseName || trimmed == "@type "+baseName {
+
+				// Found it — extract source_file and source_line from following lines
+				node := &GraphNode{
+					Name:          baseName,
+					QualifiedName: module + "." + target,
+					Module:        module,
+				}
+
+				// Determine kind
+				if strings.HasPrefix(trimmed, "@fn") {
+					if strings.Contains(target, ".") {
+						node.Kind = "Method"
+					} else {
+						node.Kind = "Function"
+					}
+				} else {
+					node.Kind = "Type"
+				}
+
+				// Scan next few lines for @source_file and @source_line
+				for j := i + 1; j < len(lines) && j < i+15; j++ {
+					nextLine := strings.TrimSpace(lines[j])
+					if strings.HasPrefix(nextLine, "---") || strings.HasPrefix(nextLine, "@fn ") || strings.HasPrefix(nextLine, "@type ") {
+						break
+					}
+					if strings.HasPrefix(nextLine, "@source_file ") {
+						node.SourceFile = strings.TrimPrefix(nextLine, "@source_file ")
+					}
+					if strings.HasPrefix(nextLine, "@source_line ") {
+						lineNum, err := strconv.Atoi(strings.TrimPrefix(nextLine, "@source_line "))
+						if err == nil {
+							node.SourceLine = lineNum
+						}
+					}
+				}
+
+				return node, nil
+			}
+		}
+	}
+
+	return nil, fmt.Errorf("symbol %q not found in AID files", target)
 }
 
 // collectNodes extracts all unique nodes from a GraphResult.
@@ -289,6 +374,25 @@ func ResolveSourceFile(file, sourceDir, aidDir string) string {
 		if _, err := os.Stat(candidate); err == nil {
 			return candidate
 		}
+	}
+	// Last resort: search recursively under sourceDir for the filename.
+	// This handles cases where @source_file is relative to the package
+	// directory (e.g., "types.go") but sourceDir is a parent (e.g., "internal/").
+	baseName := filepath.Base(file)
+	var found string
+	filepath.Walk(sourceDir, func(path string, info os.FileInfo, err error) error {
+		if err != nil {
+			return nil
+		}
+		if !info.IsDir() && info.Name() == baseName {
+			// Verify it's the right file by checking the line count is plausible
+			found = path
+			return filepath.SkipAll
+		}
+		return nil
+	})
+	if found != "" {
+		return found
 	}
 	// Default: join with sourceDir (original behavior)
 	return filepath.Join(sourceDir, file)
