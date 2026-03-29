@@ -279,6 +279,21 @@ func (r *Resolver) findSymbolNodes(intent Intent) ([]GraphNode, error) {
 	if result != nil && len(result.Paths) > 0 {
 		// The first node in the first path is typically the target symbol
 		primary := result.Paths[0].Nodes[0]
+
+		// If cartograph didn't provide source_file/source_line, supplement
+		// from AID files. This happens when AID uses bare filenames that
+		// cartograph can't resolve to absolute paths.
+		if primary.SourceFile == "" || primary.SourceLine == 0 {
+			if aidNode, err := scanAidFilesForSymbol(intent.AidDir, intent.Target); err == nil {
+				if primary.SourceFile == "" {
+					primary.SourceFile = aidNode.SourceFile
+				}
+				if primary.SourceLine == 0 {
+					primary.SourceLine = aidNode.SourceLine
+				}
+			}
+		}
+
 		return []GraphNode{primary}, nil
 	}
 
@@ -363,6 +378,29 @@ func scanAidFilesForSymbol(aidDir, target string) (*GraphNode, error) {
 					}
 				}
 
+				// If source_file is a bare filename (no directory), try to
+				// qualify it using the module name. This prevents ambiguity when
+				// multiple packages have files with the same name (e.g.,
+				// hashindexV2/hash_index_api.go vs hashindexV3/hash_index_api.go).
+				if node.SourceFile != "" && !strings.Contains(node.SourceFile, "/") && module != "" {
+					// Search for module/filename under the project root
+					projectRoot := filepath.Dir(filepath.Clean(aidDir))
+					var match string
+					filepath.Walk(projectRoot, func(path string, info os.FileInfo, err error) error {
+						if err != nil || info.IsDir() {
+							return nil
+						}
+						if info.Name() == node.SourceFile && strings.Contains(filepath.Dir(path), module) {
+							match = path
+							return filepath.SkipAll
+						}
+						return nil
+					})
+					if match != "" {
+						node.SourceFile = match
+					}
+				}
+
 				return node, nil
 			}
 		}
@@ -420,6 +458,15 @@ func (r *Resolver) locateAll(nodes []GraphNode, sourceDir, aidDir, symbolName, f
 				}
 			}
 		}
+
+		// Supplemental sweep: grep for type-qualified call patterns across the
+		// source tree. Cartograph may miss callers when the call graph has
+		// indirect edges (e.g., Close calls storage.FlushWithHeaderUpdate
+		// instead of Flush directly). Searching for common variable patterns
+		// like "hashIndex.Flush" catches these without matching unrelated types.
+		typeName := strings.SplitN(fullTarget, ".", 2)[0]
+		typeLocs := grepTypedMethodCalls(sourceDir, typeName, symbolName)
+		locations = append(locations, typeLocs...)
 	} else {
 		// For non-method renames (types, functions), grep the whole tree
 		grepLocs := grepSymbol(sourceDir, symbolName)
@@ -475,7 +522,6 @@ func ResolveSourceFile(file, sourceDir, aidDir string) string {
 			return nil
 		}
 		if !info.IsDir() && info.Name() == baseName {
-			// Verify it's the right file by checking the line count is plausible
 			found = path
 			return filepath.SkipAll
 		}
@@ -517,6 +563,39 @@ func grepSymbolInFile(file, symbolName string) []Location {
 		return nil
 	}
 	return parseGrepOutputSingleFile(string(output), file)
+}
+
+// grepTypedMethodCalls greps for common variable-name patterns that indicate
+// a call on the target type. For type "HashIndexV3" and method "Flush", this
+// searches for patterns like "hashIndex.Flush" and "newIndex.Flush" — variable
+// names that contain the core type name (minus version suffixes).
+// This catches callers that cartograph misses when AID @calls edges use
+// internal method names instead of the public API method.
+func grepTypedMethodCalls(sourceDir, typeName, methodName string) []Location {
+	if sourceDir == "" || typeName == "" || methodName == "" {
+		return nil
+	}
+
+	// Build a case-insensitive grep pattern for common Go variable naming:
+	// Type "HashIndexV3" → core "hashindex" → pattern "[hH]ashindex.*\.Flush"
+	// This matches: hashIndex.Flush, newHashIndex.Flush, hi.Flush won't match (too short)
+	lower := strings.ToLower(typeName)
+	core := strings.TrimRight(strings.TrimRight(lower, "0123456789"), "v")
+	if len(core) < 4 {
+		core = lower
+	}
+
+	// grep for the pattern: any word containing the core type name, followed by .Method
+	// Case-insensitive (-i) because Go variables use camelCase (hashIndex) while
+	// the core type name is lowercase (hashindex). The edit phase's ScopeMatch
+	// handles exact method name matching.
+	pattern := core + "[a-zA-Z0-9_]*\\." + methodName
+	cmd := exec.Command("grep", "-rn", "-i", "-E", "--include=*.go", pattern, sourceDir)
+	output, err := cmd.Output()
+	if err != nil {
+		return nil
+	}
+	return parseGrepOutput(string(output))
 }
 
 // grepSymbolInTests runs grep on test files to find test references.
