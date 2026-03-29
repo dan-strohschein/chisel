@@ -1,6 +1,6 @@
 # Chisel
 
-Semantic refactoring tool powered by [AID](https://github.com/dan-strohschein/AID) + [Cartograph](https://github.com/dan-strohschein/cartograph). Performs precise, codebase-wide renames, moves, and error propagation using a semantic graph instead of text-level find-and-replace.
+Semantic refactoring tool powered by [AID](https://github.com/dan-strohschein/AID-Docs) + [Cartograph](https://github.com/dan-strohschein/cartograph). Performs precise, codebase-wide renames, moves, and error propagation using a semantic graph instead of text-level find-and-replace.
 
 ## Why Chisel?
 
@@ -13,7 +13,7 @@ For distinctive names like `GetBundleByName`, chisel skips the graph entirely an
 ### Prerequisites
 
 - Go 1.21+
-- [AID](https://github.com/dan-strohschein/AID) — `.aidocs/` skeleton files for your project
+- [AID](https://github.com/dan-strohschein/AID-Docs) — `.aidocs/` skeleton files for your project
 - [Cartograph](https://github.com/dan-strohschein/cartograph) — semantic graph engine (binary on PATH or specified via flag)
 
 ### Build from source
@@ -30,7 +30,7 @@ Chisel requires `.aidocs/` skeleton files. Generate them with `aid-gen-go`:
 
 ```bash
 # Install the AID generator
-go install github.com/dan-strohschein/AID/tools/aid-gen-go@latest
+go install github.com/dan-strohschein/aidkit/cmd/aid-gen-go@latest
 
 # Generate skeletons (including test coverage)
 aid-gen-go -test -output .aidocs ./...
@@ -180,7 +180,7 @@ chisel/
 
 ## Dependencies
 
-- [aidkit](https://github.com/dan-strohschein/AID) — AID file parser
+- [aidkit](https://github.com/dan-strohschein/aidkit) — AID file parser
 - [cartograph](https://github.com/dan-strohschein/cartograph) — Semantic graph query engine
 
 ## License
