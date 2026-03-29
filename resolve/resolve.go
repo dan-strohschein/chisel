@@ -56,15 +56,15 @@ func (r *Resolver) resolveRename(intent Intent) (*Resolution, error) {
 	baseName := SymbolBaseName(intent.Target)
 	isMethod := strings.Contains(intent.Target, ".")
 
-	// Fast path: if the basename is rare across AID files, skip the semantic
-	// graph and grep the entire source tree. Names like "GetBundleByName" appear
-	// on at most a few types (real + mocks) — a full-tree grep is safe and fast.
-	// Only skip this for truly ambiguous names (Close, Get, Flush) that appear
-	// on many unrelated types where grep would cause false positives.
+	// Fast path: if a full-tree grep for this basename is safe (won't cause
+	// false positives), skip the semantic graph entirely. Safety is determined
+	// by analyzing AID files:
+	// - If only one type has this method → always safe (unique name)
+	// - If multiple types share it AND they're all related (interface
+	//   implementations, mocks, adapters) → safe (renaming one requires all)
+	// - If unrelated types share the name → NOT safe, use cartograph
 	if isMethod && intent.AidDir != "" {
-		count := countAidSymbolsByBaseName(intent.AidDir, baseName)
-		if count <= 5 {
-			// Rare name — use fast grep path instead of scoped graph traversal
+		if isGrepSafeForBaseName(intent.AidDir, intent.Target, baseName) {
 			return r.resolveRenameUnique(intent, baseName)
 		}
 	}
@@ -148,19 +148,25 @@ func (r *Resolver) resolveRenameUnique(intent Intent, baseName string) (*Resolut
 	return res, nil
 }
 
-// countAidSymbolsByBaseName counts how many @fn entries in AID files have
-// methods with the given basename. Used to detect unique names that don't
-// need semantic disambiguation.
-func countAidSymbolsByBaseName(aidDir, baseName string) int {
+// isGrepSafeForBaseName determines whether a full-tree grep for the basename
+// is safe (won't cause false positives). Uses a layered analysis:
+//
+//  1. Count types sharing this method name in AID files
+//  2. If unique (1 type) → always safe
+//  3. If the name is distinctive (long, multi-word like GetBundleByName) →
+//     safe even with multiple types, since distinctive names don't collide
+//     across unrelated types
+//  4. If the name is generic (Close, Flush, Get) → check interface
+//     relationships. Safe only if all types share an interface.
+func isGrepSafeForBaseName(aidDir, target, baseName string) bool {
 	files, err := filepath.Glob(filepath.Join(aidDir, "*.aid"))
 	if err != nil {
-		return 0
+		return false
 	}
 
-	count := 0
-	// Match @fn lines where the function name ends with ".baseName"
-	// e.g., for baseName="Close": matches "WALManager.Close", "BTreeIndex.Close", etc.
+	// Phase 1: collect all types that have this method
 	suffix := "." + baseName
+	var typesWithMethod []string
 	for _, file := range files {
 		content, err := os.ReadFile(file)
 		if err != nil {
@@ -170,13 +176,183 @@ func countAidSymbolsByBaseName(aidDir, baseName string) int {
 			trimmed := strings.TrimSpace(line)
 			if strings.HasPrefix(trimmed, "@fn ") {
 				fnName := strings.TrimPrefix(trimmed, "@fn ")
-				if strings.HasSuffix(fnName, suffix) || fnName == baseName {
-					count++
+				if strings.HasSuffix(fnName, suffix) {
+					typeName := fnName[:len(fnName)-len(suffix)]
+					typesWithMethod = append(typesWithMethod, typeName)
+				} else if fnName == baseName {
+					typesWithMethod = append(typesWithMethod, "")
 				}
 			}
 		}
 	}
-	return count
+
+	if len(typesWithMethod) <= 1 {
+		return true // Unique — always safe
+	}
+
+	// Phase 2: check name distinctiveness. Multi-word camelCase names like
+	// "GetBundleByName" or "CleanTombstones" are distinctive enough that
+	// different types won't independently invent the same name for unrelated
+	// purposes. Single-word names like "Close", "Flush", "Get" are generic
+	// and commonly appear on unrelated types.
+	//
+	// Heuristic: count uppercase letters (word boundaries in camelCase).
+	// "Close" has 1, "CleanTombstones" has 2, "GetBundleByName" has 4.
+	// Names with 2+ words are distinctive.
+	upperCount := 0
+	for _, ch := range baseName {
+		if ch >= 'A' && ch <= 'Z' {
+			upperCount++
+		}
+	}
+	if upperCount >= 3 {
+		return true // Distinctive multi-word name — safe for grep
+	}
+
+	// Phase 3: generic single-word name — check interface relationships.
+	// Look for @requires blocks containing "fn <baseName>(" in AID files.
+	var interfacesWithMethod []string
+	for _, file := range files {
+		content, err := os.ReadFile(file)
+		if err != nil {
+			continue
+		}
+		lines := strings.Split(string(content), "\n")
+		var currentType string
+		inRequires := false
+		for _, line := range lines {
+			trimmed := strings.TrimSpace(line)
+			if strings.HasPrefix(trimmed, "@type ") || strings.HasPrefix(trimmed, "@trait ") {
+				tag := "@type "
+				if strings.HasPrefix(trimmed, "@trait ") {
+					tag = "@trait "
+				}
+				currentType = strings.TrimPrefix(trimmed, tag)
+				inRequires = false
+			}
+			if trimmed == "@requires" {
+				inRequires = true
+			}
+			if strings.HasPrefix(trimmed, "---") {
+				inRequires = false
+			}
+			// Check for method in @requires block: "fn MethodName(" or just "MethodName("
+			if inRequires && currentType != "" {
+				if strings.Contains(trimmed, "fn "+baseName+"(") || strings.HasPrefix(trimmed, baseName+"(") {
+					interfacesWithMethod = append(interfacesWithMethod, currentType)
+				}
+			}
+			// Also check @purpose lines for "implements <Interface>" pattern
+			if strings.HasPrefix(trimmed, "@purpose") && strings.Contains(trimmed, "implements") {
+				// This is on a method — we'll use it in phase 3
+			}
+		}
+	}
+
+	// Phase 3: for each type with the method, check if it's related to the
+	// target type (shares an interface, is a mock/fake, or references the target).
+	targetType := ""
+	if strings.Contains(target, ".") {
+		targetType = strings.SplitN(target, ".", 2)[0]
+	}
+
+	// Build a set of interface names for quick lookup
+	ifaceSet := make(map[string]bool)
+	for _, iface := range interfacesWithMethod {
+		ifaceSet[strings.ToLower(iface)] = true
+	}
+
+	unrelatedCount := 0
+	for _, typeName := range typesWithMethod {
+		if typeName == targetType {
+			continue // The target itself — always included
+		}
+		// Check if this type is related to an interface or to the target type
+		if isTypeRelatedToInterfaces(aidDir, typeName, ifaceSet, targetType) {
+			continue // Related — safe to include
+		}
+		unrelatedCount++
+	}
+
+	return unrelatedCount == 0
+}
+
+// isTypeRelatedToInterfaces checks if a type implements any of the given
+// interfaces by scanning its @purpose and @related annotations in AID files.
+func isTypeRelatedToInterfaces(aidDir, typeName string, interfaces map[string]bool, targetType string) bool {
+	files, err := filepath.Glob(filepath.Join(aidDir, "*.aid"))
+	if err != nil {
+		return false
+	}
+
+	lowerTarget := strings.ToLower(targetType)
+
+	// Check if the type name itself contains the target type name.
+	// E.g., "mockBundleServiceForBTreeRangeScan" contains "bundleservice".
+	lowerTypeName := strings.ToLower(typeName)
+	if strings.Contains(lowerTypeName, lowerTarget) {
+		return true
+	}
+
+	for _, file := range files {
+		content, err := os.ReadFile(file)
+		if err != nil {
+			continue
+		}
+		lines := strings.Split(string(content), "\n")
+		inType := false
+		for _, line := range lines {
+			trimmed := strings.TrimSpace(line)
+
+			// Track when we're in the right @type block
+			if strings.HasPrefix(trimmed, "@type "+typeName) || strings.HasPrefix(trimmed, "@trait "+typeName) {
+				inType = true
+				continue
+			}
+			if inType && (strings.HasPrefix(trimmed, "---") || (strings.HasPrefix(trimmed, "@type ") || strings.HasPrefix(trimmed, "@trait "))) {
+				inType = false
+			}
+
+			if !inType {
+				continue
+			}
+
+			// Check @related for the target type or any interface
+			if strings.HasPrefix(trimmed, "@related") {
+				lowerLine := strings.ToLower(trimmed)
+				if strings.Contains(lowerLine, lowerTarget) {
+					return true
+				}
+				for iface := range interfaces {
+					if strings.Contains(lowerLine, iface) {
+						return true
+					}
+				}
+			}
+
+			// Check @purpose for "implements <Interface>" patterns
+			if strings.HasPrefix(trimmed, "@purpose") {
+				lowerLine := strings.ToLower(trimmed)
+				for iface := range interfaces {
+					if strings.Contains(lowerLine, iface) {
+						return true
+					}
+				}
+				// Also check if purpose mentions the target type
+				if strings.Contains(lowerLine, lowerTarget) {
+					return true
+				}
+				// Check for common mock/test patterns
+				if strings.Contains(lowerLine, "mock") || strings.Contains(lowerLine, "fake") || strings.Contains(lowerLine, "stub") {
+					if strings.Contains(lowerLine, lowerTarget) {
+						return true
+					}
+				}
+			}
+		}
+	}
+
+	return false
 }
 
 func (r *Resolver) resolveMove(intent Intent) (*Resolution, error) {
