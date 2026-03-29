@@ -25,3 +25,5 @@ go.work.sum
 
 # Local settings
 .claude/settings.local.json
+benchmark-rerun-prompt.md
+summary.md
