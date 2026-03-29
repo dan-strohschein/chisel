@@ -78,7 +78,7 @@ func TestGenerateRenameEdits(t *testing.T) {
 		AffectedModules: []string{"testpkg"},
 	}
 
-	edits, err := GenerateRenameEdits(resolution, "GraphQueryEngine")
+	edits, err := GenerateRenameEdits(resolution, "GraphQueryEngine", nil)
 	if err != nil {
 		t.Fatalf("GenerateRenameEdits failed: %v", err)
 	}
@@ -121,7 +121,7 @@ func TestGenerateEditsFullPipeline(t *testing.T) {
 		AffectedModules: []string{"testpkg"},
 	}
 
-	editSet, err := GenerateEdits(resolution)
+	editSet, err := GenerateEdits(resolution, nil)
 	if err != nil {
 		t.Fatalf("GenerateEdits failed: %v", err)
 	}

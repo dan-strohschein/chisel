@@ -11,13 +11,19 @@ import (
 )
 
 // GenerateEdits takes a Resolution and produces all text edits needed.
-func GenerateEdits(resolution *resolve.Resolution) (*EditSet, error) {
+// The optional typeResolver is used to disambiguate method calls via LSP
+// when heuristics are insufficient. Pass nil to use heuristic-only mode.
+func GenerateEdits(resolution *resolve.Resolution, typeResolver resolve.TypeResolver) (*EditSet, error) {
+	if typeResolver == nil {
+		typeResolver = &resolve.NullResolver{}
+	}
+
 	var edits []Edit
 	var err error
 
 	switch resolution.Intent.Kind {
 	case resolve.Rename:
-		edits, err = GenerateRenameEdits(resolution, resolution.Intent.NewName)
+		edits, err = GenerateRenameEdits(resolution, resolution.Intent.NewName, typeResolver)
 	case resolve.Move:
 		edits, err = GenerateMoveEdits(resolution, resolution.Intent.Destination)
 	case resolve.Propagate:
@@ -51,7 +57,9 @@ func GenerateEdits(resolution *resolve.Resolution) (*EditSet, error) {
 }
 
 // GenerateRenameEdits generates edits for a rename operation.
-func GenerateRenameEdits(resolution *resolve.Resolution, newName string) ([]Edit, error) {
+// typeResolver is used to verify ambiguous call sites via LSP. When nil or
+// NullResolver, falls back to heuristic-based disambiguation.
+func GenerateRenameEdits(resolution *resolve.Resolution, newName string, typeResolver resolve.TypeResolver) ([]Edit, error) {
 	oldName := resolve.SymbolBaseName(resolution.Intent.Target)
 	newBaseName := resolve.SymbolBaseName(newName)
 	isMethodRename := strings.Contains(resolution.Intent.Target, ".")
@@ -98,7 +106,14 @@ func GenerateRenameEdits(resolution *resolve.Resolution, newName string) ([]Edit
 		// type name (e.g., receiver "s" for BundleService).
 		if isMethodRename && !resolution.FastPath {
 			if !isMethodRenameCandidate(context, oldName, typeName, loc, defFile, defLine) {
-				continue
+				// Heuristic says skip — but if LSP is available, ask it to verify.
+				// The heuristic is conservative (rejects valid renames when variable
+				// names don't match the type), so LSP can recover false negatives.
+				lspType := typeResolver.ResolveType(loc.File, loc.Line, loc.Column)
+				if lspType == "" || !strings.EqualFold(lspType, typeName) {
+					continue // Both heuristic and LSP say skip (or LSP unavailable)
+				}
+				// LSP overrides heuristic — this IS the right type
 			}
 		}
 
