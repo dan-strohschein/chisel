@@ -1,6 +1,7 @@
 package resolve
 
 import (
+	"bufio"
 	"fmt"
 	"os"
 	"os/exec"
@@ -1169,6 +1170,81 @@ func buildResolution(intent Intent, primary GraphNode, locations []Location, war
 	}
 }
 
+// parseErrorMapFromAIDText extracts @error_map / @entries blocks from raw AID
+// text. This works with aidkit versions that do not yet register error_map as
+// a structured annotation (e.g. v0.1.0), while still matching AID line rules
+// via parser.ClassifyLine.
+func parseErrorMapFromAIDText(content string) map[string]ErrorHandling {
+	out := make(map[string]ErrorHandling)
+	scanner := bufio.NewScanner(strings.NewReader(content))
+	waitingEntries := false
+	inEntries := false
+
+	for scanner.Scan() {
+		line := scanner.Text()
+		lt, fieldName, _ := parser.ClassifyLine(line)
+
+		switch lt {
+		case parser.LineSeparator:
+			waitingEntries = false
+			inEntries = false
+
+		case parser.LineField:
+			switch {
+			case fieldName == "error_map":
+				waitingEntries = true
+				inEntries = false
+			case fieldName == "entries" && waitingEntries:
+				inEntries = true
+				waitingEntries = false
+			default:
+				waitingEntries = false
+				inEntries = false
+			}
+
+		case parser.LineContinuation:
+			if !inEntries {
+				continue
+			}
+			funcName, handling := parseErrorMapEntry(strings.TrimSpace(line))
+			if funcName != "" {
+				out[funcName] = handling
+			}
+
+		case parser.LineBlank, parser.LineComment:
+			// skip
+		}
+	}
+
+	if len(out) == 0 {
+		return nil
+	}
+	return out
+}
+
+// mergeErrorMapAnnotations copies @error_map entries from parsed annotations
+// into dest (used when aidkit recognizes error_map as an annotation).
+func mergeErrorMapAnnotations(dest map[string]ErrorHandling, af *parser.AidFile) {
+	if af == nil {
+		return
+	}
+	for _, ann := range af.Annotations {
+		if ann.Kind != "error_map" {
+			continue
+		}
+		entriesField, ok := ann.Fields["entries"]
+		if !ok {
+			continue
+		}
+		for _, line := range entriesField.Lines {
+			funcName, handling := parseErrorMapEntry(strings.TrimSpace(line))
+			if funcName != "" {
+				dest[funcName] = handling
+			}
+		}
+	}
+}
+
 // readErrorMap scans AID files in aidDir for @error_map annotations and
 // returns a map of function name → ErrorHandling strategy. The @error_map
 // annotation fields contain entries like:
@@ -1194,26 +1270,23 @@ func readErrorMap(aidDir string) map[string]ErrorHandling {
 		if e.IsDir() || !strings.HasSuffix(e.Name(), ".aid") {
 			continue
 		}
-		af, _, err := parser.ParseFile(filepath.Join(aidDir, e.Name()))
+		path := filepath.Join(aidDir, e.Name())
+
+		raw, err := os.ReadFile(path)
 		if err != nil {
 			continue
 		}
-		for _, ann := range af.Annotations {
-			if ann.Kind != "error_map" {
-				continue
-			}
-			// Parse the @entries field for error handling strategies
-			entriesField, ok := ann.Fields["entries"]
-			if !ok {
-				continue
-			}
-			for _, line := range entriesField.Lines {
-				funcName, handling := parseErrorMapEntry(strings.TrimSpace(line))
-				if funcName != "" {
-					errorMap[funcName] = handling
-				}
+		if textMap := parseErrorMapFromAIDText(string(raw)); textMap != nil {
+			for k, v := range textMap {
+				errorMap[k] = v
 			}
 		}
+
+		af, _, err := parser.ParseFile(path)
+		if err != nil {
+			continue
+		}
+		mergeErrorMapAnnotations(errorMap, af)
 	}
 
 	if len(errorMap) == 0 {

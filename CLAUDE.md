@@ -37,6 +37,8 @@ All commands default to dry-run (preview diff). Pass `--apply` to modify files.
 - `github.com/dan-strohschein/aidkit/pkg/parser` — AID file parser
 - `github.com/dan-strohschein/cartograph` — Semantic graph and query engine
 
+**Local cartograph / aidkit (no `replace` in `go.mod`):** `go.work` and `go.work.sum` are gitignored. With siblings at `../cartograph` and `../AID/tools/aidkit`, run `cp go.work.example go.work` then `go work sync`. Go commands in this repo will use those trees; CI and fresh clones keep using published versions from `go.mod`.
+
 ## Build
 
 ```bash

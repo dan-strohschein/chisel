@@ -64,10 +64,9 @@ type LibraryGraphQuerier struct {
 }
 
 // NewLibraryGraphQuerier loads AID files from the given directory and
-// builds an in-memory graph with a query engine. Uses gob caching for
-// faster subsequent loads.
+// builds an in-memory graph with a query engine.
 func NewLibraryGraphQuerier(aidDir string) (*LibraryGraphQuerier, error) {
-	g, err := loader.LoadFromDirectoryCached(aidDir)
+	g, err := loader.LoadFromDirectory(aidDir)
 	if err != nil {
 		return nil, fmt.Errorf("loading graph from %s: %w", aidDir, err)
 	}

@@ -1,0 +1,13 @@
+// Local development: copy to go.work (gitignored) to build against sibling repos
+// instead of the module proxy. Adjust paths if your layout differs.
+//
+//	cp go.work.example go.work
+//	go work sync
+
+go 1.25.5
+
+use (
+	.
+	../cartograph
+	../AID/tools/aidkit
+)
