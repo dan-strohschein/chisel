@@ -8,6 +8,9 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+
+	"github.com/dan-strohschein/aidkit/pkg/parser"
+	"github.com/dan-strohschein/cartograph/pkg/query"
 )
 
 // NotFoundError indicates the target symbol was not found in the graph.
@@ -40,16 +43,33 @@ type Resolver struct {
 
 // Resolve takes a refactoring intent and returns all affected locations.
 func (r *Resolver) Resolve(intent Intent) (*Resolution, error) {
+	var resolution *Resolution
+	var err error
+
 	switch intent.Kind {
 	case Rename:
-		return r.resolveRename(intent)
+		resolution, err = r.resolveRename(intent)
 	case Move:
-		return r.resolveMove(intent)
+		resolution, err = r.resolveMove(intent)
 	case Propagate:
-		return r.resolvePropagate(intent)
+		resolution, err = r.resolvePropagate(intent)
+	case Extract:
+		resolution, err = r.resolveExtract(intent)
 	default:
 		return nil, fmt.Errorf("unknown refactor kind: %d", intent.Kind)
 	}
+
+	if err != nil {
+		return nil, err
+	}
+
+	// Check lock safety when using library mode (has access to graph)
+	if libQuerier, ok := r.Graph.(*LibraryGraphQuerier); ok {
+		lockWarnings := CheckLockSafety(libQuerier, intent.Target)
+		resolution.Warnings = append(resolution.Warnings, lockWarnings...)
+	}
+
+	return resolution, nil
 }
 
 func (r *Resolver) resolveRename(intent Intent) (*Resolution, error) {
@@ -381,6 +401,100 @@ func (r *Resolver) resolveMove(intent Intent) (*Resolution, error) {
 }
 
 func (r *Resolver) resolvePropagate(intent Intent) (*Resolution, error) {
+	// Prefer the error-aware path when the querier supports it.
+	// ErrorProducers follows ProducesError + PropagatesError edges for
+	// transitive error chain discovery, which is more complete than
+	// the callstack-only approach.
+	if eq, ok := r.Graph.(ErrorQuerier); ok {
+		return r.resolvePropagateViaErrors(intent, eq)
+	}
+	return r.resolvePropagateViaCallstack(intent)
+}
+
+// resolvePropagateViaErrors uses cartograph's ErrorProducers query to find
+// all functions in the error chain, including transitive propagation.
+func (r *Resolver) resolvePropagateViaErrors(intent Intent, eq ErrorQuerier) (*Resolution, error) {
+	nodes, err := r.findSymbolNodes(intent)
+	if err != nil {
+		return nil, err
+	}
+	primary := nodes[0]
+
+	// Query error producers for the error type — this follows
+	// ProducesError and PropagatesError edges transitively
+	errorResult, err := eq.ErrorProducers(intent.ErrorType)
+	if err != nil {
+		// Fall back to callstack approach if error query fails
+		return r.resolvePropagateViaCallstack(intent)
+	}
+
+	// Also get callers via callstack for call-site discovery
+	callResult, _ := r.Graph.Query("callstack", []string{intent.Target, "--up"}, intent.AidDir)
+
+	// Merge nodes from both error chain and call chain
+	allNodes := []GraphNode{primary}
+	locations, warnings := r.locateAll(allNodes, intent.SourceDir, intent.AidDir, SymbolBaseName(intent.Target), intent.Target)
+
+	// Collect caller nodes from both queries
+	baseName := SymbolBaseName(intent.Target)
+	seen := make(map[string]bool)
+
+	// Process error chain nodes
+	errorNodes := collectNodes(errorResult)
+	for _, node := range errorNodes {
+		if node.QualifiedName == primary.QualifiedName {
+			continue
+		}
+		if node.SourceFile == "" {
+			continue
+		}
+		file := ResolveSourceFile(node.SourceFile, intent.SourceDir, intent.AidDir)
+		if seen[file] {
+			continue
+		}
+		seen[file] = true
+		fileLocs := grepSymbolInFile(file, baseName)
+		for i := range fileLocs {
+			fileLocs[i].SymbolKind = "call"
+		}
+		locations = append(locations, fileLocs...)
+	}
+
+	// Also process callstack nodes (may find callers the error graph missed)
+	if callResult != nil {
+		callerNodes := collectNodes(callResult)
+		for _, node := range callerNodes {
+			if node.QualifiedName == primary.QualifiedName {
+				continue
+			}
+			if node.SourceFile == "" {
+				continue
+			}
+			file := ResolveSourceFile(node.SourceFile, intent.SourceDir, intent.AidDir)
+			if seen[file] {
+				continue
+			}
+			seen[file] = true
+			fileLocs := grepSymbolInFile(file, baseName)
+			for i := range fileLocs {
+				fileLocs[i].SymbolKind = "call"
+			}
+			locations = append(locations, fileLocs...)
+		}
+	}
+
+	locations = deduplicateLocations(locations)
+	sortLocations(locations)
+
+	resolution := buildResolution(intent, primary, locations, warnings)
+	resolution.ErrorMap = readErrorMap(intent.AidDir)
+	return resolution, nil
+}
+
+// resolvePropagateViaCallstack is the original propagate implementation
+// using only callstack --up queries. Used as fallback when the querier
+// doesn't support ErrorProducers (e.g., CLI mode).
+func (r *Resolver) resolvePropagateViaCallstack(intent Intent) (*Resolution, error) {
 	nodes, err := r.findSymbolNodes(intent)
 	if err != nil {
 		return nil, err
@@ -429,7 +543,90 @@ func (r *Resolver) resolvePropagate(intent Intent) (*Resolution, error) {
 	locations = deduplicateLocations(locations)
 	sortLocations(locations)
 
-	return buildResolution(intent, primary, locations, warnings), nil
+	resolution := buildResolution(intent, primary, locations, warnings)
+	resolution.ErrorMap = readErrorMap(intent.AidDir)
+	return resolution, nil
+}
+
+// resolveExtract identifies a function and its private dependencies for
+// extraction to a new package. Requires library mode.
+func (r *Resolver) resolveExtract(intent Intent) (*Resolution, error) {
+	libQuerier, ok := r.Graph.(*LibraryGraphQuerier)
+	if !ok {
+		return nil, fmt.Errorf("extract requires library mode (do not use --cartograph flag)")
+	}
+
+	nodes, err := r.findSymbolNodes(intent)
+	if err != nil {
+		return nil, err
+	}
+	primary := nodes[0]
+
+	// Find all callees (forward call chain)
+	callResult, err := libQuerier.Engine.CallStack(intent.Target, query.Forward)
+	if err != nil {
+		return nil, fmt.Errorf("querying callees: %w", err)
+	}
+
+	// Get all symbols in the target's current module
+	moduleResult, err := libQuerier.Engine.ListModule(primary.Module)
+	if err != nil {
+		return nil, fmt.Errorf("listing module %s: %w", primary.Module, err)
+	}
+
+	// Build set of module-local symbols
+	moduleSymbols := make(map[string]bool)
+	if moduleResult != nil {
+		for _, nodes := range moduleResult.Matches {
+			for _, n := range nodes {
+				moduleSymbols[n.QualifiedName] = true
+			}
+		}
+	}
+
+	// Identify private dependencies: callees in the same module that are
+	// unexported and only called by functions being extracted.
+	var dependencies []GraphNode
+	calleeNodes := collectNodes(convertQueryResult(callResult))
+	for _, callee := range calleeNodes {
+		if callee.QualifiedName == primary.QualifiedName {
+			continue
+		}
+		if callee.Module != primary.Module {
+			continue
+		}
+		// Check if the symbol is exported (public). Exported symbols stay in
+		// the original package since other code may depend on them.
+		calleeBase := SymbolBaseName(callee.Name)
+		if IsExported(calleeBase, intent.Language) {
+			continue
+		}
+		dependencies = append(dependencies, callee)
+	}
+
+	// Locate all affected code
+	allNodes := []GraphNode{primary}
+	allNodes = append(allNodes, dependencies...)
+	locations, warnings := r.locateAll(allNodes, intent.SourceDir, intent.AidDir, SymbolBaseName(intent.Target), intent.Target)
+
+	// Also find import locations for the current module (callers need import updates)
+	importLocs := findImportLocations(intent.SourceDir, primary.Module)
+	locations = append(locations, importLocs...)
+
+	resolution := buildResolution(intent, primary, locations, warnings)
+	resolution.Dependencies = dependencies
+
+	if len(dependencies) > 0 {
+		depNames := make([]string, len(dependencies))
+		for i, d := range dependencies {
+			depNames[i] = d.Name
+		}
+		resolution.Warnings = append(resolution.Warnings,
+			fmt.Sprintf("will also extract %d private dependencies: %s",
+				len(dependencies), strings.Join(depNames, ", ")))
+	}
+
+	return resolution, nil
 }
 
 // findSymbolNodes queries cartograph and resolves the target to graph node(s).
@@ -613,10 +810,18 @@ func (r *Resolver) locateAll(nodes []GraphNode, sourceDir, aidDir, symbolName, f
 	var locations []Location
 	var warnings []string
 
+	// Collect definition locations from graph node source metadata.
+	// Track which files have graph-sourced definitions so grep can
+	// focus on finding references rather than re-discovering definitions.
+	graphDefinitionFiles := make(map[string]bool)
 	for _, node := range nodes {
 		locs := FindSourceLocations(node, sourceDir, aidDir, symbolName)
+		for _, loc := range locs {
+			graphDefinitionFiles[loc.File] = true
+		}
 		locations = append(locations, locs...)
 	}
+	hasGraphLocations := len(graphDefinitionFiles) > 0
 
 	isMethodRename := strings.Contains(fullTarget, ".")
 
@@ -643,8 +848,14 @@ func (r *Resolver) locateAll(nodes []GraphNode, sourceDir, aidDir, symbolName, f
 		typeName := strings.SplitN(fullTarget, ".", 2)[0]
 		typeLocs := grepTypedMethodCalls(sourceDir, typeName, symbolName)
 		locations = append(locations, typeLocs...)
+	} else if hasGraphLocations {
+		// When graph nodes provided definition locations, grep only for
+		// references (call sites, type refs) — don't re-discover definitions.
+		// This is faster and avoids duplicate definition entries.
+		grepLocs := grepSymbol(sourceDir, symbolName)
+		locations = append(locations, grepLocs...)
 	} else {
-		// For non-method renames (types, functions), grep the whole tree
+		// No graph source locations — grep the whole tree for everything
 		grepLocs := grepSymbol(sourceDir, symbolName)
 		locations = append(locations, grepLocs...)
 	}
@@ -955,5 +1166,103 @@ func buildResolution(intent Intent, primary GraphNode, locations []Location, war
 		AffectedFiles:   fileList,
 		AffectedModules: moduleList,
 		Warnings:        warnings,
+	}
+}
+
+// readErrorMap scans AID files in aidDir for @error_map annotations and
+// returns a map of function name → ErrorHandling strategy. The @error_map
+// annotation fields contain entries like:
+//
+//	@entries
+//	  BundleService.GetBundle: wrap "fetching bundle: %w"
+//	  CacheService.Get: log
+//	  Validator.Validate: return
+//	  Parser.Parse: convert ValidationError
+func readErrorMap(aidDir string) map[string]ErrorHandling {
+	if aidDir == "" {
+		return nil
+	}
+
+	errorMap := make(map[string]ErrorHandling)
+
+	entries, err := os.ReadDir(aidDir)
+	if err != nil {
+		return nil
+	}
+
+	for _, e := range entries {
+		if e.IsDir() || !strings.HasSuffix(e.Name(), ".aid") {
+			continue
+		}
+		af, _, err := parser.ParseFile(filepath.Join(aidDir, e.Name()))
+		if err != nil {
+			continue
+		}
+		for _, ann := range af.Annotations {
+			if ann.Kind != "error_map" {
+				continue
+			}
+			// Parse the @entries field for error handling strategies
+			entriesField, ok := ann.Fields["entries"]
+			if !ok {
+				continue
+			}
+			for _, line := range entriesField.Lines {
+				funcName, handling := parseErrorMapEntry(strings.TrimSpace(line))
+				if funcName != "" {
+					errorMap[funcName] = handling
+				}
+			}
+		}
+	}
+
+	if len(errorMap) == 0 {
+		return nil
+	}
+	return errorMap
+}
+
+// parseErrorMapEntry parses a single @error_map entry line like:
+//
+//	BundleService.GetBundle: wrap "fetching bundle: %w"
+//	CacheService.Get: log
+//	Validator.Validate: return
+//	Parser.Parse: convert ValidationError
+func parseErrorMapEntry(line string) (string, ErrorHandling) {
+	parts := strings.SplitN(line, ":", 2)
+	if len(parts) < 2 {
+		return "", ErrorHandling{}
+	}
+	funcName := strings.TrimSpace(parts[0])
+	rest := strings.TrimSpace(parts[1])
+
+	if rest == "" {
+		return funcName, ErrorHandling{Strategy: "return"}
+	}
+
+	fields := strings.Fields(rest)
+	strategy := fields[0]
+
+	switch strategy {
+	case "wrap":
+		msg := ""
+		// Extract quoted message
+		if idx := strings.Index(rest, "\""); idx >= 0 {
+			endIdx := strings.LastIndex(rest, "\"")
+			if endIdx > idx {
+				msg = rest[idx+1 : endIdx]
+			}
+		}
+		return funcName, ErrorHandling{Strategy: "wrap", WrapMsg: msg}
+	case "log":
+		return funcName, ErrorHandling{Strategy: "log"}
+	case "convert":
+		target := ""
+		if len(fields) > 1 {
+			target = fields[1]
+		}
+		return funcName, ErrorHandling{Strategy: "convert", ConvertTo: target}
+	default:
+		return funcName, ErrorHandling{Strategy: "return"}
 	}
 }

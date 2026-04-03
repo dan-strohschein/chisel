@@ -1,5 +1,31 @@
 package resolve
 
+import "strings"
+
+// IsExported returns true if a symbol name is public/exported in the given language.
+// Defaults to Go convention if language is empty or unrecognized.
+func IsExported(name, lang string) bool {
+	if len(name) == 0 {
+		return false
+	}
+	switch strings.ToLower(lang) {
+	case "python":
+		// Python: underscore prefix means private
+		return !strings.HasPrefix(name, "_")
+	case "rust":
+		// Rust: pub keyword determines visibility, but at the name level
+		// we can't tell — assume exported unless starts with underscore
+		return !strings.HasPrefix(name, "_")
+	case "java", "kotlin", "c#", "csharp":
+		// Java/Kotlin/C#: visibility is keyword-based, not name-based.
+		// At the name level we can't determine visibility — assume exported.
+		return true
+	default:
+		// Go: uppercase first letter = exported
+		return name[0] >= 'A' && name[0] <= 'Z'
+	}
+}
+
 // RefactorKind identifies the type of refactoring operation.
 type RefactorKind int
 
@@ -7,6 +33,7 @@ const (
 	Rename    RefactorKind = iota // Rename a symbol across the codebase
 	Move                          // Move a symbol to a different package
 	Propagate                     // Add error return and propagate through callers
+	Extract                       // Extract a function and its private dependencies to a new package
 )
 
 // Intent is a parsed refactoring request.
@@ -19,6 +46,7 @@ type Intent struct {
 	AidDir          string // Path to .aidocs/ directory
 	SourceDir       string // Path to source tree
 	IncludeComments bool   // If true, also rename occurrences in comments
+	Language        string // Source language from AID @lang (e.g., "go", "python", "rust")
 }
 
 // Location is a specific occurrence of a symbol in a source file.
@@ -39,7 +67,9 @@ type Resolution struct {
 	AffectedFiles   []string
 	AffectedModules []string
 	Warnings        []string
-	FastPath        bool // True when resolved via grep (rare name), no type disambiguation needed
+	FastPath        bool                     // True when resolved via grep (rare name), no type disambiguation needed
+	ErrorMap        map[string]ErrorHandling // For propagate: per-function error handling strategies from @error_map
+	Dependencies    []GraphNode              // For extract: private dependencies that should move with the target
 }
 
 // GraphNode is a code entity from cartograph's JSON output.
@@ -74,6 +104,14 @@ type GraphResult struct {
 	NodeCount int         `json:"node_count"`
 	MaxDepth  int         `json:"max_depth"`
 	Paths     []GraphPath `json:"paths"`
+}
+
+// ErrorHandling describes how a specific call site should handle errors,
+// derived from @error_map annotations in AID files.
+type ErrorHandling struct {
+	Strategy  string // "wrap", "return", "log", "convert"
+	WrapMsg   string // For "wrap": the fmt.Errorf template (e.g., "fetching bundle: %w")
+	ConvertTo string // For "convert": the target error type
 }
 
 // EffectEntry is a single entry in a cartograph effects report.

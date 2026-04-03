@@ -4,8 +4,11 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"path/filepath"
 	"strings"
 
+	"github.com/dan-strohschein/aidkit/pkg/parser"
+	"github.com/dan-strohschein/aidkit/pkg/validator"
 	"github.com/dan-strohschein/chisel/edit"
 )
 
@@ -34,6 +37,7 @@ type Patch struct {
 	DryRun           bool
 	Diff             string
 	Errors           []string
+	Warnings         []string // Non-fatal validation warnings (e.g., broken AID cross-references)
 }
 
 // Apply applies an EditSet to the filesystem, or previews as a diff.
@@ -72,6 +76,20 @@ func Apply(editSet *edit.EditSet, options PatchOptions) (*Patch, error) {
 				allDiffs = append(allDiffs, diff)
 				result.AidFilesModified++
 			}
+
+			// Validate the AID file after edits
+			var content string
+			if len(edits) == 1 && edits[0].Kind == edit.WholeFile {
+				content = edits[0].NewText
+			} else if !options.DryRun {
+				data, err := os.ReadFile(file)
+				if err == nil {
+					content = string(data)
+				}
+			}
+			if content != "" {
+				validateAidContent(file, content, result)
+			}
 		}
 	}
 
@@ -81,24 +99,46 @@ func Apply(editSet *edit.EditSet, options PatchOptions) (*Patch, error) {
 
 // ApplyToFile applies all edits for a single file.
 func ApplyToFile(file string, edits []edit.Edit, dryRun bool, backupSuffix string) (string, error) {
+	// Handle FileCreate edits (new files that don't exist yet)
+	if len(edits) == 1 && edits[0].Kind == edit.FileCreate {
+		newContent := edits[0].NewText
+		diff := fmt.Sprintf("--- /dev/null\n+++ b/%s\n@@ -0,0 +1 @@\n+%s\n", file, strings.ReplaceAll(newContent, "\n", "\n+"))
+		if !dryRun {
+			if err := os.MkdirAll(filepath.Dir(file), 0755); err != nil {
+				return "", fmt.Errorf("creating directory for %s: %w", file, err)
+			}
+			if err := os.WriteFile(file, []byte(newContent), 0644); err != nil {
+				return "", fmt.Errorf("writing %s: %w", file, err)
+			}
+		}
+		return diff, nil
+	}
+
 	content, err := os.ReadFile(file)
 	if err != nil {
 		return "", fmt.Errorf("reading %s: %w", file, err)
 	}
 
 	original := string(content)
-	lines := strings.Split(original, "\n")
+	var modified string
 
-	// Edits are pre-sorted by line descending — apply bottom to top
-	for _, e := range edits {
-		if e.Line < 1 || e.Line > len(lines) {
-			continue
+	// Check for whole-file replacement (emitter-based AID edits use Line=0)
+	if len(edits) == 1 && edits[0].Kind == edit.WholeFile {
+		modified = edits[0].NewText
+	} else {
+		lines := strings.Split(original, "\n")
+
+		// Edits are pre-sorted by line descending — apply bottom to top
+		for _, e := range edits {
+			if e.Line < 1 || e.Line > len(lines) {
+				continue
+			}
+			idx := e.Line - 1
+			lines[idx] = strings.Replace(lines[idx], e.OldText, e.NewText, 1)
 		}
-		idx := e.Line - 1
-		lines[idx] = strings.Replace(lines[idx], e.OldText, e.NewText, 1)
-	}
 
-	modified := strings.Join(lines, "\n")
+		modified = strings.Join(lines, "\n")
+	}
 
 	if original == modified {
 		return "", nil
@@ -239,6 +279,12 @@ func FormatPatch(p *Patch, format string) string {
 				s += "  - " + e + "\n"
 			}
 		}
+		if len(p.Warnings) > 0 {
+			s += fmt.Sprintf("\n%d warning(s):\n", len(p.Warnings))
+			for _, w := range p.Warnings {
+				s += "  - " + w + "\n"
+			}
+		}
 		return s
 	default: // "unified"
 		if p.Diff == "" {
@@ -246,6 +292,26 @@ func FormatPatch(p *Patch, format string) string {
 		}
 		header := FormatPatch(p, "summary")
 		return header + "\n\n" + p.Diff
+	}
+}
+
+// validateAidContent parses and validates an AID file's content,
+// appending any warnings to the patch result.
+func validateAidContent(file, content string, result *Patch) {
+	af, _, err := parser.ParseString(content)
+	if err != nil {
+		result.Warnings = append(result.Warnings, fmt.Sprintf("AID parse error after edit in %s: %v", file, err))
+		return
+	}
+	issues := validator.Validate(af)
+	for _, issue := range issues {
+		if issue.Severity >= validator.SeverityWarning {
+			msg := fmt.Sprintf("AID validation [%s] %s", file, issue.Message)
+			if issue.Entry != "" {
+				msg = fmt.Sprintf("AID validation [%s] %s: %s", file, issue.Entry, issue.Message)
+			}
+			result.Warnings = append(result.Warnings, msg)
+		}
 	}
 }
 
