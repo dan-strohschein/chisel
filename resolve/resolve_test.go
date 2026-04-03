@@ -2,9 +2,13 @@ package resolve
 
 import (
 	"encoding/json"
+	"os"
 	"path/filepath"
 	"runtime"
 	"testing"
+
+	"github.com/dan-strohschein/cartograph/pkg/graph"
+	"github.com/dan-strohschein/cartograph/pkg/query"
 )
 
 // MockGraphQuerier returns canned responses for testing.
@@ -182,5 +186,357 @@ func TestSymbolBaseName(t *testing.T) {
 		if got != tt.want {
 			t.Errorf("SymbolBaseName(%q) = %q, want %q", tt.input, got, tt.want)
 		}
+	}
+}
+
+func TestIsExported(t *testing.T) {
+	tests := []struct {
+		name string
+		lang string
+		want bool
+	}{
+		// Go: uppercase = exported, lowercase = unexported
+		{"QueryEngine", "go", true},
+		{"queryEngine", "go", false},
+		{"A", "go", true},
+		{"a", "go", false},
+		// Empty name is never exported
+		{"", "go", false},
+
+		// Python: underscore prefix = private
+		{"get_data", "python", true},
+		{"_private", "python", false},
+		{"__dunder__", "python", false},
+		{"PublicClass", "python", true},
+
+		// Rust: underscore prefix = private (at name level)
+		{"process", "rust", true},
+		{"_internal", "rust", false},
+		{"Config", "rust", true},
+
+		// Java: keyword-based visibility, name-level always returns true
+		{"getData", "java", true},
+		{"privateHelper", "java", true},
+
+		// Default (unrecognized) falls back to Go convention
+		{"Exported", "unknown", true},
+		{"unexported", "unknown", false},
+		{"Exported", "", true},
+		{"unexported", "", false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.lang+"/"+tt.name, func(t *testing.T) {
+			got := IsExported(tt.name, tt.lang)
+			if got != tt.want {
+				t.Errorf("IsExported(%q, %q) = %v, want %v", tt.name, tt.lang, got, tt.want)
+			}
+		})
+	}
+}
+
+func TestParseErrorMapEntry(t *testing.T) {
+	tests := []struct {
+		line       string
+		wantFunc   string
+		wantStrat  string
+		wantWrap   string
+		wantConv   string
+	}{
+		{
+			line:      `BundleService.GetBundle: wrap "fetching bundle: %w"`,
+			wantFunc:  "BundleService.GetBundle",
+			wantStrat: "wrap",
+			wantWrap:  "fetching bundle: %w",
+		},
+		{
+			line:      "CacheService.Get: log",
+			wantFunc:  "CacheService.Get",
+			wantStrat: "log",
+		},
+		{
+			line:      "Validator.Validate: return",
+			wantFunc:  "Validator.Validate",
+			wantStrat: "return",
+		},
+		{
+			line:      "Parser.Parse: convert ValidationError",
+			wantFunc:  "Parser.Parse",
+			wantStrat: "convert",
+			wantConv:  "ValidationError",
+		},
+		{
+			// Unknown strategy defaults to return
+			line:      "Foo.Bar: something_else",
+			wantFunc:  "Foo.Bar",
+			wantStrat: "return",
+		},
+		{
+			// Empty strategy defaults to return
+			line:      "Foo.Bar:",
+			wantFunc:  "Foo.Bar",
+			wantStrat: "return",
+		},
+		{
+			// No colon — invalid line
+			line:     "no colon here",
+			wantFunc: "",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.line, func(t *testing.T) {
+			funcName, handling := parseErrorMapEntry(tt.line)
+			if funcName != tt.wantFunc {
+				t.Errorf("funcName = %q, want %q", funcName, tt.wantFunc)
+			}
+			if funcName == "" {
+				return
+			}
+			if handling.Strategy != tt.wantStrat {
+				t.Errorf("strategy = %q, want %q", handling.Strategy, tt.wantStrat)
+			}
+			if handling.WrapMsg != tt.wantWrap {
+				t.Errorf("wrapMsg = %q, want %q", handling.WrapMsg, tt.wantWrap)
+			}
+			if handling.ConvertTo != tt.wantConv {
+				t.Errorf("convertTo = %q, want %q", handling.ConvertTo, tt.wantConv)
+			}
+		})
+	}
+}
+
+func TestReadErrorMap(t *testing.T) {
+	tmpDir := t.TempDir()
+
+	aidContent := `@module testpkg
+@lang go
+
+---
+
+@error_map errors
+@entries
+  BundleService.GetBundle: wrap "fetching bundle: %w"
+  CacheService.Get: log
+  Validator.Validate: return
+  Parser.Parse: convert ValidationError
+`
+	if err := os.WriteFile(filepath.Join(tmpDir, "testpkg.aid"), []byte(aidContent), 0644); err != nil {
+		t.Fatalf("writing temp aid file: %v", err)
+	}
+
+	result := readErrorMap(tmpDir)
+	if result == nil {
+		t.Fatal("readErrorMap returned nil, expected entries")
+	}
+
+	// Check wrap strategy
+	if h, ok := result["BundleService.GetBundle"]; !ok {
+		t.Error("missing entry for BundleService.GetBundle")
+	} else {
+		if h.Strategy != "wrap" {
+			t.Errorf("BundleService.GetBundle strategy = %q, want %q", h.Strategy, "wrap")
+		}
+		if h.WrapMsg != "fetching bundle: %w" {
+			t.Errorf("BundleService.GetBundle wrapMsg = %q, want %q", h.WrapMsg, "fetching bundle: %w")
+		}
+	}
+
+	// Check log strategy
+	if h, ok := result["CacheService.Get"]; !ok {
+		t.Error("missing entry for CacheService.Get")
+	} else if h.Strategy != "log" {
+		t.Errorf("CacheService.Get strategy = %q, want %q", h.Strategy, "log")
+	}
+
+	// Check return strategy
+	if h, ok := result["Validator.Validate"]; !ok {
+		t.Error("missing entry for Validator.Validate")
+	} else if h.Strategy != "return" {
+		t.Errorf("Validator.Validate strategy = %q, want %q", h.Strategy, "return")
+	}
+
+	// Check convert strategy
+	if h, ok := result["Parser.Parse"]; !ok {
+		t.Error("missing entry for Parser.Parse")
+	} else {
+		if h.Strategy != "convert" {
+			t.Errorf("Parser.Parse strategy = %q, want %q", h.Strategy, "convert")
+		}
+		if h.ConvertTo != "ValidationError" {
+			t.Errorf("Parser.Parse convertTo = %q, want %q", h.ConvertTo, "ValidationError")
+		}
+	}
+
+	// Verify count
+	if len(result) != 4 {
+		t.Errorf("expected 4 entries, got %d", len(result))
+	}
+
+	// Empty directory returns nil
+	emptyDir := t.TempDir()
+	if got := readErrorMap(emptyDir); got != nil {
+		t.Errorf("readErrorMap on empty dir = %v, want nil", got)
+	}
+
+	// Empty string returns nil
+	if got := readErrorMap(""); got != nil {
+		t.Errorf("readErrorMap(\"\") = %v, want nil", got)
+	}
+}
+
+func TestCheckLockSafety(t *testing.T) {
+	g := graph.NewGraph()
+
+	// Add a Lock node
+	lockID := graph.MakeNodeID("pkg", graph.KindLock, "mu")
+	g.AddNode(graph.Node{
+		ID:            lockID,
+		Kind:          graph.KindLock,
+		Name:          "mu",
+		QualifiedName: "pkg.mu",
+		Module:        "pkg",
+		Metadata:      map[string]string{},
+	})
+
+	// Add a Function node that acquires the lock
+	funcID := graph.MakeNodeID("pkg", graph.KindFunction, "ProcessRequest")
+	g.AddNode(graph.Node{
+		ID:            funcID,
+		Kind:          graph.KindFunction,
+		Name:          "ProcessRequest",
+		QualifiedName: "pkg.ProcessRequest",
+		Module:        "pkg",
+		Metadata:      map[string]string{},
+	})
+
+	// Add an Acquires edge: ProcessRequest -> mu
+	g.AddEdge(graph.Edge{
+		Source: funcID,
+		Target: lockID,
+		Kind:   graph.EdgeAcquires,
+	})
+
+	engine := query.NewQueryEngine(g, 10)
+	querier := &LibraryGraphQuerier{Engine: engine, Graph: g}
+
+	// Function that acquires the lock should produce a warning
+	warnings := CheckLockSafety(querier, "ProcessRequest")
+	if len(warnings) == 0 {
+		t.Fatal("expected warnings for function that acquires a lock, got none")
+	}
+	found := false
+	for _, w := range warnings {
+		if contains(w, "ProcessRequest") && contains(w, "mu") {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Errorf("expected warning mentioning ProcessRequest and mu, got: %v", warnings)
+	}
+
+	// Function that does NOT acquire the lock should produce no warnings
+	warnings = CheckLockSafety(querier, "SomeOtherFunc")
+	if len(warnings) != 0 {
+		t.Errorf("expected no warnings for unrelated function, got: %v", warnings)
+	}
+
+	// Graph with no locks should return nil
+	emptyG := graph.NewGraph()
+	emptyG.AddNode(graph.Node{
+		ID:            graph.MakeNodeID("pkg", graph.KindFunction, "Foo"),
+		Kind:          graph.KindFunction,
+		Name:          "Foo",
+		QualifiedName: "pkg.Foo",
+		Module:        "pkg",
+		Metadata:      map[string]string{},
+	})
+	emptyEngine := query.NewQueryEngine(emptyG, 10)
+	emptyQuerier := &LibraryGraphQuerier{Engine: emptyEngine, Graph: emptyG}
+	if warnings := CheckLockSafety(emptyQuerier, "Foo"); warnings != nil {
+		t.Errorf("expected nil warnings for graph with no locks, got: %v", warnings)
+	}
+}
+
+func TestImpact(t *testing.T) {
+	g := graph.NewGraph()
+
+	// Add a Type node
+	typeID := graph.MakeNodeID("pkg", graph.KindType, "QueryEngine")
+	g.AddNode(graph.Node{
+		ID:            typeID,
+		Kind:          graph.KindType,
+		Name:          "QueryEngine",
+		QualifiedName: "pkg.QueryEngine",
+		Module:        "pkg",
+		SourceFile:    "pkg/engine.go",
+		SourceLine:    10,
+		Metadata:      map[string]string{},
+	})
+
+	// Add a Function node that depends on the type
+	funcID := graph.MakeNodeID("pkg", graph.KindFunction, "ProcessRequest")
+	g.AddNode(graph.Node{
+		ID:            funcID,
+		Kind:          graph.KindFunction,
+		Name:          "ProcessRequest",
+		QualifiedName: "pkg.ProcessRequest",
+		Module:        "pkg",
+		SourceFile:    "pkg/handler.go",
+		SourceLine:    25,
+		Metadata:      map[string]string{},
+	})
+
+	// Add DependsOn edge: ProcessRequest -> QueryEngine
+	g.AddEdge(graph.Edge{
+		Source: funcID,
+		Target: typeID,
+		Kind:   graph.EdgeDependsOn,
+	})
+
+	engine := query.NewQueryEngine(g, 10)
+	querier := &LibraryGraphQuerier{Engine: engine, Graph: g}
+
+	report, err := Impact(querier, "QueryEngine")
+	if err != nil {
+		t.Fatalf("Impact failed: %v", err)
+	}
+
+	if report.Symbol != "QueryEngine" {
+		t.Errorf("report.Symbol = %q, want %q", report.Symbol, "QueryEngine")
+	}
+	if report.Kind != "Type" {
+		t.Errorf("report.Kind = %q, want %q", report.Kind, "Type")
+	}
+
+	// Should have at least one dependent
+	if len(report.Dependents) == 0 {
+		t.Error("expected at least one dependent, got none")
+	}
+
+	// Check that dependents include the expected nodes
+	foundFunc := false
+	for _, dep := range report.Dependents {
+		if dep.Name == "ProcessRequest" {
+			foundFunc = true
+		}
+	}
+	if !foundFunc {
+		t.Errorf("expected ProcessRequest in dependents, got: %v", report.Dependents)
+	}
+
+	// Check affected files
+	if len(report.AffectedFiles) == 0 {
+		t.Error("expected at least one affected file")
+	}
+
+	// Summary should be non-empty
+	if report.Summary == "" {
+		t.Error("expected non-empty summary")
+	}
+
+	// Non-existent symbol should return error
+	_, err = Impact(querier, "NonexistentSymbol")
+	if err == nil {
+		t.Error("expected error for non-existent symbol")
 	}
 }

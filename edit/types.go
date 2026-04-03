@@ -14,6 +14,8 @@ const (
 	CallSiteUpdate                  // Update a function call
 	TypeReference                   // Update a type reference
 	AidUpdate                       // Update an AID file
+	WholeFile                       // Whole-file replacement (used by emitter-based AID edits)
+	FileCreate                      // Create a new file (used by extract command)
 )
 
 // Edit is a single text edit to apply to a source file.

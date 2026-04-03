@@ -1,18 +1,22 @@
 package main
 
 import (
+	"encoding/json"
 	"flag"
 	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
 
+	"github.com/dan-strohschein/cartograph/pkg/query"
 	"github.com/dan-strohschein/chisel/edit"
 	"github.com/dan-strohschein/chisel/patch"
 	"github.com/dan-strohschein/chisel/resolve"
 )
 
-const version = "0.1.0"
+// version is set at build time via -ldflags="-X main.version=vX.Y.Z".
+// Falls back to "dev" for local builds.
+var version = "dev"
 
 func main() {
 	if len(os.Args) < 2 {
@@ -22,7 +26,11 @@ func main() {
 
 	subcmd := os.Args[1]
 	if subcmd == "version" || subcmd == "--version" {
-		fmt.Printf("chisel v%s\n", version)
+		v := version
+		if len(v) > 0 && v[0] == 'v' {
+			v = v[1:]
+		}
+		fmt.Printf("chisel v%s\n", v)
 		return
 	}
 
@@ -90,6 +98,19 @@ func main() {
 		}
 	}
 
+	// Handle query commands (effects, impact, stale) — these bypass Edit/Patch pipeline
+	switch subcmd {
+	case "effects":
+		runEffects(positional, aidDir, *format)
+		return
+	case "impact":
+		runImpact(positional, aidDir, sourceDir, *format)
+		return
+	case "stale":
+		runStale(sourceDir, *format)
+		return
+	}
+
 	// Build intent
 	intent, err := buildIntent(subcmd, positional, aidDir, sourceDir)
 	if err != nil {
@@ -98,9 +119,25 @@ func main() {
 		os.Exit(1)
 	}
 	intent.IncludeComments = *includeComments
+	intent.Language = detectLanguage(aidDir)
 
-	// Set up resolver
-	querier := &resolve.CLIGraphQuerier{BinaryPath: *cartographBin}
+	// Set up resolver — prefer in-process library, fall back to CLI binary
+	var querier resolve.GraphQuerier
+	if *cartographBin != "" {
+		// Explicit binary path: use CLI mode
+		querier = &resolve.CLIGraphQuerier{BinaryPath: *cartographBin}
+	} else if aidDir != "" {
+		// Try library mode (in-process, faster, richer queries)
+		libQuerier, err := resolve.NewLibraryGraphQuerier(aidDir)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Warning: library graph load failed: %v (falling back to CLI)\n", err)
+			querier = &resolve.CLIGraphQuerier{}
+		} else {
+			querier = libQuerier
+		}
+	} else {
+		querier = &resolve.CLIGraphQuerier{}
+	}
 	resolver := &resolve.Resolver{Graph: querier}
 
 	// Phase 1: Resolve
@@ -155,6 +192,9 @@ func main() {
 	for _, w := range resolution.Warnings {
 		fmt.Fprintf(os.Stderr, "Warning: %s\n", w)
 	}
+	for _, w := range result.Warnings {
+		fmt.Fprintf(os.Stderr, "Warning: %s\n", w)
+	}
 }
 
 func buildIntent(subcmd string, positional []string, aidDir, sourceDir string) (resolve.Intent, error) {
@@ -191,9 +231,46 @@ func buildIntent(subcmd string, positional []string, aidDir, sourceDir string) (
 		base.ErrorType = positional[1]
 		return base, nil
 
+	case "extract":
+		if len(positional) < 2 {
+			return base, fmt.Errorf("extract requires: chisel extract <function> <new-package>")
+		}
+		base.Kind = resolve.Extract
+		base.Target = positional[0]
+		base.Destination = positional[1]
+		return base, nil
+
 	default:
 		return base, fmt.Errorf("unknown command: %s", subcmd)
 	}
+}
+
+// detectLanguage reads the @lang header from the first AID file found
+// in the aidDir. Returns "go" as default if not determinable.
+func detectLanguage(aidDir string) string {
+	if aidDir == "" {
+		return "go"
+	}
+	entries, err := os.ReadDir(aidDir)
+	if err != nil {
+		return "go"
+	}
+	for _, e := range entries {
+		if e.IsDir() || !strings.HasSuffix(e.Name(), ".aid") {
+			continue
+		}
+		content, err := os.ReadFile(filepath.Join(aidDir, e.Name()))
+		if err != nil {
+			continue
+		}
+		for _, line := range strings.Split(string(content), "\n") {
+			trimmed := strings.TrimSpace(line)
+			if strings.HasPrefix(trimmed, "@lang ") {
+				return strings.TrimSpace(strings.TrimPrefix(trimmed, "@lang"))
+			}
+		}
+	}
+	return "go"
 }
 
 func resolveAidDir(explicit string) string {
@@ -217,6 +294,77 @@ func resolveAidDir(explicit string) string {
 	return ""
 }
 
+func runEffects(positional []string, aidDir, format string) {
+	if len(positional) < 1 {
+		fmt.Fprintf(os.Stderr, "effects requires: chisel effects <function>\n")
+		os.Exit(1)
+	}
+	if aidDir == "" {
+		fmt.Fprintf(os.Stderr, "Error: effects requires .aidocs/ directory\n")
+		os.Exit(1)
+	}
+	libQuerier, err := resolve.NewLibraryGraphQuerier(aidDir)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Error loading graph: %v\n", err)
+		os.Exit(1)
+	}
+	report, err := libQuerier.Engine.SideEffects(positional[0])
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+		os.Exit(1)
+	}
+	switch format {
+	case "json":
+		data, _ := json.MarshalIndent(report, "", "  ")
+		fmt.Println(string(data))
+	default:
+		fmt.Print(query.FormatEffectReport(report))
+	}
+}
+
+func runImpact(positional []string, aidDir, sourceDir, format string) {
+	if len(positional) < 1 {
+		fmt.Fprintf(os.Stderr, "impact requires: chisel impact <symbol>\n")
+		os.Exit(1)
+	}
+	if aidDir == "" {
+		fmt.Fprintf(os.Stderr, "Error: impact requires .aidocs/ directory\n")
+		os.Exit(1)
+	}
+	libQuerier, err := resolve.NewLibraryGraphQuerier(aidDir)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Error loading graph: %v\n", err)
+		os.Exit(1)
+	}
+	report, err := resolve.Impact(libQuerier, positional[0])
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+		os.Exit(1)
+	}
+	switch format {
+	case "json":
+		data, _ := json.MarshalIndent(report, "", "  ")
+		fmt.Println(string(data))
+	default:
+		fmt.Print(resolve.FormatImpactReport(report))
+	}
+}
+
+func runStale(sourceDir, format string) {
+	reports, err := resolve.CheckAllStaleness(sourceDir)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+		os.Exit(1)
+	}
+	switch format {
+	case "json":
+		data, _ := json.MarshalIndent(reports, "", "  ")
+		fmt.Println(string(data))
+	default:
+		fmt.Print(resolve.FormatStaleReports(reports))
+	}
+}
+
 func printUsage() {
 	fmt.Fprintf(os.Stderr, `chisel — semantic refactoring powered by AID + Cartograph
 
@@ -224,6 +372,10 @@ Usage:
   chisel rename <old> <new>                    Rename a symbol across the codebase
   chisel move <symbol> <destination-package>   Move a symbol to another package
   chisel propagate <function> <error-type>     Add error return and propagate through callers
+  chisel extract <function> <new-package>       Extract function and deps to new package
+  chisel effects <function>                    Show transitive side effects
+  chisel impact <symbol>                       Comprehensive impact analysis
+  chisel stale                                 Check for stale AID claims
 
 Flags:
   --dir <path>          Path to .aidocs/ directory (default: auto-discover)
@@ -235,6 +387,6 @@ Flags:
   --include-comments    Also rename occurrences in comments (default: code only)
   --lsp-cmd <cmd>       LSP server for type verification (e.g., "gopls serve")
 
-All commands default to dry-run. Pass --apply to modify files.
+All refactoring commands default to dry-run. Pass --apply to modify files.
 `)
 }

@@ -7,6 +7,8 @@ import (
 	"sort"
 	"strings"
 
+	"github.com/dan-strohschein/aidkit/pkg/emitter"
+	"github.com/dan-strohschein/aidkit/pkg/parser"
 	"github.com/dan-strohschein/chisel/resolve"
 )
 
@@ -28,6 +30,8 @@ func GenerateEdits(resolution *resolve.Resolution, typeResolver resolve.TypeReso
 		edits, err = GenerateMoveEdits(resolution, resolution.Intent.Destination)
 	case resolve.Propagate:
 		edits, err = GeneratePropagateEdits(resolution, resolution.Intent.ErrorType)
+	case resolve.Extract:
+		edits, err = GenerateExtractEdits(resolution, resolution.Intent.Destination)
 	default:
 		return nil, fmt.Errorf("unknown refactor kind: %d", resolution.Intent.Kind)
 	}
@@ -89,7 +93,10 @@ func GenerateRenameEdits(resolution *resolve.Resolution, newName string, typeRes
 			context = line
 		}
 
-		lang := "go" // Default; could be derived from AID @lang
+		lang := resolution.Intent.Language
+		if lang == "" {
+			lang = "go"
+		}
 		if !ScopeMatch(context, oldName, lang, resolution.Intent.IncludeComments) {
 			continue
 		}
@@ -335,11 +342,290 @@ func GeneratePropagateEdits(resolution *resolve.Resolution, errorType string) ([
 			}
 			context = line
 		}
-		callEdits := generateCallSiteEdits(loc, context, resolution.Intent.Target, errorType)
+		callEdits := generateCallSiteEdits(loc, context, resolution.Intent.Target, errorType, resolution.ErrorMap)
 		edits = append(edits, callEdits...)
 	}
 
 	return edits, nil
+}
+
+// GenerateExtractEdits generates edits for extracting a function (and its
+// private dependencies) to a new package. Creates a new file in the
+// destination package and updates import statements in referencing files.
+func GenerateExtractEdits(resolution *resolve.Resolution, destination string) ([]Edit, error) {
+	var edits []Edit
+
+	// Determine the new package name (last component of destination)
+	destPkg := destination
+	if idx := strings.LastIndex(destination, "/"); idx >= 0 {
+		destPkg = destination[idx+1:]
+	}
+
+	// Build the new file content with extracted functions
+	var newFileContent strings.Builder
+	newFileContent.WriteString(fmt.Sprintf("package %s\n", destPkg))
+
+	// Collect imports needed by the extracted functions
+	importSet := make(map[string]bool)
+
+	// Read and extract function bodies from the source file
+	extractedFuncs := []resolve.GraphNode{resolution.Symbol}
+	extractedFuncs = append(extractedFuncs, resolution.Dependencies...)
+
+	for _, node := range extractedFuncs {
+		if node.SourceFile == "" || node.SourceLine <= 0 {
+			continue
+		}
+		file := resolve.ResolveSourceFile(node.SourceFile, resolution.Intent.SourceDir, resolution.Intent.AidDir)
+		body, err := extractFunctionBody(file, node.SourceLine)
+		if err != nil {
+			continue
+		}
+		newFileContent.WriteString("\n")
+		newFileContent.WriteString(body)
+		newFileContent.WriteString("\n")
+
+		// Scan for package-qualified references to determine needed imports
+		collectImportsFromBody(file, body, importSet)
+	}
+
+	// If the extracted code references types from its original package,
+	// add an import for the original module
+	if resolution.Symbol.Module != "" && resolution.Symbol.Module != destination {
+		// Check if any extracted body references the original package's types
+		origPkg := resolution.Symbol.Module
+		if idx := strings.LastIndex(origPkg, "/"); idx >= 0 {
+			origPkg = origPkg[idx+1:]
+		}
+		content := newFileContent.String()
+		if strings.Contains(content, origPkg+".") {
+			importSet[resolution.Symbol.Module] = true
+		}
+	}
+
+	// Insert import block after package declaration if needed
+	if len(importSet) > 0 {
+		var importBlock strings.Builder
+		importBlock.WriteString("\nimport (\n")
+		for imp := range importSet {
+			importBlock.WriteString(fmt.Sprintf("\t\"%s\"\n", imp))
+		}
+		importBlock.WriteString(")\n")
+
+		// Insert after "package <name>\n"
+		full := newFileContent.String()
+		pkgEnd := strings.Index(full, "\n")
+		if pkgEnd >= 0 {
+			full = full[:pkgEnd+1] + importBlock.String() + full[pkgEnd+1:]
+		}
+		newFileContent.Reset()
+		newFileContent.WriteString(full)
+	}
+
+	// Create the new file
+	newFilePath := filepath.Join(resolution.Intent.SourceDir, destination, resolve.SymbolBaseName(resolution.Symbol.Name)+".go")
+	edits = append(edits, Edit{
+		File:    newFilePath,
+		Line:    0,
+		OldText: "",
+		NewText: newFileContent.String(),
+		Kind:    FileCreate,
+	})
+
+	// Generate import updates: files that reference the target need to
+	// import the new package instead of (or in addition to) the old one
+	for _, loc := range resolution.Locations {
+		if loc.SymbolKind == "import" {
+			edits = append(edits, Edit{
+				File:    loc.File,
+				Line:    loc.Line,
+				OldText: resolution.Symbol.Module,
+				NewText: destination,
+				Kind:    ImportUpdate,
+			})
+		}
+	}
+
+	return edits, nil
+}
+
+// collectImportsFromBody scans the source file's existing imports and checks
+// which ones are referenced in the extracted function body.
+func collectImportsFromBody(sourceFile, body string, importSet map[string]bool) {
+	content, err := os.ReadFile(sourceFile)
+	if err != nil {
+		return
+	}
+	source := string(content)
+
+	// Find import block in source file
+	importStart := strings.Index(source, "import (")
+	if importStart < 0 {
+		// Try single import
+		importStart = strings.Index(source, "import \"")
+		if importStart < 0 {
+			return
+		}
+	}
+	importEnd := strings.Index(source[importStart:], ")")
+	if importEnd < 0 {
+		return
+	}
+	importBlock := source[importStart : importStart+importEnd+1]
+
+	// Extract each import path and check if its package name appears in the body
+	for _, line := range strings.Split(importBlock, "\n") {
+		line = strings.TrimSpace(line)
+		// Extract path from: "path/to/pkg" or alias "path/to/pkg"
+		quoteStart := strings.Index(line, "\"")
+		quoteEnd := strings.LastIndex(line, "\"")
+		if quoteStart < 0 || quoteEnd <= quoteStart {
+			continue
+		}
+		importPath := line[quoteStart+1 : quoteEnd]
+
+		// Determine the package name (last path component or alias)
+		pkgName := importPath
+		if idx := strings.LastIndex(pkgName, "/"); idx >= 0 {
+			pkgName = pkgName[idx+1:]
+		}
+		// Check for alias before the quote
+		prefix := strings.TrimSpace(line[:quoteStart])
+		if prefix != "" && prefix != "import" && prefix != "(" {
+			pkgName = prefix
+		}
+
+		// If the body references this package (e.g., "fmt.Errorf"), include it
+		if strings.Contains(body, pkgName+".") {
+			importSet[importPath] = true
+		}
+	}
+}
+
+// extractFunctionBody reads a function body starting from a given line number.
+// Returns the complete function text (signature through closing brace).
+// Handles braces inside string literals, raw strings, rune literals, and
+// comments so they don't affect depth tracking.
+func extractFunctionBody(file string, startLine int) (string, error) {
+	content, err := os.ReadFile(file)
+	if err != nil {
+		return "", err
+	}
+	lines := strings.Split(string(content), "\n")
+	if startLine < 1 || startLine > len(lines) {
+		return "", fmt.Errorf("line %d out of range", startLine)
+	}
+
+	var result strings.Builder
+	braceDepth := 0
+	started := false
+	inBlockComment := false
+
+	for i := startLine - 1; i < len(lines); i++ {
+		line := lines[i]
+		result.WriteString(line)
+		result.WriteString("\n")
+
+		braceDepth, started, inBlockComment = countBracesInLine(line, braceDepth, started, inBlockComment)
+
+		if started && braceDepth <= 0 {
+			break
+		}
+	}
+
+	return result.String(), nil
+}
+
+// countBracesInLine counts net braces in a line while skipping string literals,
+// raw strings, rune literals, line comments, and block comments.
+// Returns updated (braceDepth, started, inBlockComment).
+func countBracesInLine(line string, braceDepth int, started, inBlockComment bool) (int, bool, bool) {
+	inString := false
+	inRawString := false
+	inRune := false
+	escaped := false
+
+	for idx := 0; idx < len(line); idx++ {
+		ch := line[idx]
+
+		// Block comment state
+		if inBlockComment {
+			if ch == '*' && idx+1 < len(line) && line[idx+1] == '/' {
+				inBlockComment = false
+				idx++ // skip '/'
+			}
+			continue
+		}
+
+		// Escaped character inside string/rune
+		if escaped {
+			escaped = false
+			continue
+		}
+
+		// String literal
+		if inString {
+			if ch == '\\' {
+				escaped = true
+			} else if ch == '"' {
+				inString = false
+			}
+			continue
+		}
+
+		// Raw string literal
+		if inRawString {
+			if ch == '`' {
+				inRawString = false
+			}
+			continue
+		}
+
+		// Rune literal
+		if inRune {
+			if ch == '\\' {
+				escaped = true
+			} else if ch == '\'' {
+				inRune = false
+			}
+			continue
+		}
+
+		// Check for comment/string/rune starts
+		if ch == '/' && idx+1 < len(line) {
+			if line[idx+1] == '/' {
+				break // rest of line is comment
+			}
+			if line[idx+1] == '*' {
+				inBlockComment = true
+				idx++ // skip '*'
+				continue
+			}
+		}
+		if ch == '"' {
+			inString = true
+			continue
+		}
+		if ch == '`' {
+			inRawString = true
+			continue
+		}
+		if ch == '\'' {
+			inRune = true
+			continue
+		}
+
+		// Count braces
+		if ch == '{' {
+			braceDepth++
+			started = true
+		}
+		if ch == '}' {
+			braceDepth--
+		}
+	}
+
+	return braceDepth, started, inBlockComment
 }
 
 // generateReturnEdits reads the function body starting at the definition line
@@ -525,14 +811,19 @@ func findReturnTypeStart(sig string) int {
 }
 
 // generateCallSiteEdits wraps a call site with error handling.
-func generateCallSiteEdits(loc resolve.Location, line, funcName, errorType string) []Edit {
+// If errorMap is non-nil, it uses per-function strategies from @error_map
+// annotations (wrap, log, convert). Otherwise defaults to "return err".
+func generateCallSiteEdits(loc resolve.Location, line, funcName, errorType string, errorMap map[string]resolve.ErrorHandling) []Edit {
 	trimmed := strings.TrimSpace(line)
 	baseName := resolve.SymbolBaseName(funcName)
 
-	// Pattern: result := Foo() → result, err := Foo()\nif err != nil { return ..., err }
-	// Pattern: Foo() → if err := Foo(); err != nil { return ..., err }
+	// Pattern: result := Foo() → result, err := Foo()\nif err != nil { ... }
+	// Pattern: Foo() → if err := Foo(); err != nil { ... }
 
 	indent := strings.TrimRight(line, strings.TrimLeft(line, " \t"))
+
+	// Determine error handling body from @error_map or default to "return err"
+	errBody := errorHandlingBody(funcName, indent, errorMap)
 
 	if strings.Contains(trimmed, ":=") {
 		// Assignment form: result := Foo()
@@ -541,7 +832,7 @@ func generateCallSiteEdits(loc resolve.Location, line, funcName, errorType strin
 		newLHS := lhs + ", err"
 		oldLine := trimmed
 		newLine := newLHS + " := " + strings.TrimSpace(parts[1])
-		errCheck := indent + "if err != nil {\n" + indent + "\treturn err\n" + indent + "}"
+		errCheck := indent + "if err != nil {\n" + errBody + "\n" + indent + "}"
 
 		return []Edit{
 			{
@@ -561,7 +852,7 @@ func generateCallSiteEdits(loc resolve.Location, line, funcName, errorType strin
 		newLHS := lhs + ", err"
 		oldLine := trimmed
 		newLine := newLHS + " = " + strings.TrimSpace(parts[1])
-		errCheck := indent + "if err != nil {\n" + indent + "\treturn err\n" + indent + "}"
+		errCheck := indent + "if err != nil {\n" + errBody + "\n" + indent + "}"
 
 		return []Edit{
 			{
@@ -577,7 +868,7 @@ func generateCallSiteEdits(loc resolve.Location, line, funcName, errorType strin
 	// Bare call: Foo()
 	if strings.Contains(trimmed, baseName+"(") {
 		oldLine := trimmed
-		newLine := "if err := " + trimmed + " err != nil {\n" + indent + "\treturn err\n" + indent + "}"
+		newLine := "if err := " + trimmed + " err != nil {\n" + errBody + "\n" + indent + "}"
 		return []Edit{
 			{
 				File:    loc.File,
@@ -592,88 +883,155 @@ func generateCallSiteEdits(loc resolve.Location, line, funcName, errorType strin
 	return nil
 }
 
-// GenerateAidEdits generates edits to update AID files.
+// errorHandlingBody returns the body of an "if err != nil" block based on
+// the @error_map strategy for the given function. Falls back to "return err".
+func errorHandlingBody(funcName, indent string, errorMap map[string]resolve.ErrorHandling) string {
+	if errorMap == nil {
+		return indent + "\treturn err"
+	}
+
+	// Try full qualified name first, then base name
+	handling, ok := errorMap[funcName]
+	if !ok {
+		handling, ok = errorMap[resolve.SymbolBaseName(funcName)]
+	}
+	if !ok {
+		return indent + "\treturn err"
+	}
+
+	switch handling.Strategy {
+	case "wrap":
+		if handling.WrapMsg != "" {
+			return indent + "\treturn fmt.Errorf(\"" + handling.WrapMsg + "\", err)"
+		}
+		return indent + "\treturn fmt.Errorf(\"%w\", err)"
+	case "log":
+		return indent + "\tlog.Printf(\"warning: %v\", err)"
+	case "convert":
+		if handling.ConvertTo != "" {
+			return indent + "\treturn " + handling.ConvertTo + "(err)"
+		}
+		return indent + "\treturn err"
+	default:
+		return indent + "\treturn err"
+	}
+}
+
+// GenerateAidEdits generates edits to update AID files using the aidkit
+// parser and emitter for correct round-trip modification. Parses each
+// affected AID file, modifies entry names and field references in the
+// parsed structure, then emits the result as a whole-file replacement.
 func GenerateAidEdits(resolution *resolve.Resolution, sourceEdits []Edit) []Edit {
 	var edits []Edit
 
 	if resolution.Intent.Kind == resolve.Rename {
-		oldTarget := resolution.Intent.Target                  // e.g., "WALManager.Close"
-		newTarget := resolution.Intent.NewName                 // e.g., "WALManager.Shutdown"
-		oldBaseName := resolve.SymbolBaseName(oldTarget)       // e.g., "Close"
-		newBaseName := resolve.SymbolBaseName(newTarget)       // e.g., "Shutdown"
+		oldTarget := resolution.Intent.Target
+		newTarget := resolution.Intent.NewName
+		oldBaseName := resolve.SymbolBaseName(oldTarget)
+		newBaseName := resolve.SymbolBaseName(newTarget)
+		isMethod := strings.Contains(oldTarget, ".")
 
-		// Find AID files that reference this symbol
 		for _, module := range resolution.AffectedModules {
-			aidFile := findAidFile(resolution.Intent.AidDir, module)
-			if aidFile == "" {
+			aidPath := findAidFile(resolution.Intent.AidDir, module)
+			if aidPath == "" {
 				continue
 			}
 
-			content, err := os.ReadFile(aidFile)
+			af, _, err := parser.ParseFile(aidPath)
 			if err != nil {
 				continue
 			}
 
-			lines := strings.Split(string(content), "\n")
-			for i, line := range lines {
-				trimmed := strings.TrimSpace(line)
-
-				// Update @fn/@type name declarations
-				// AID uses qualified names: "@fn WALManager.Close"
-				// Use exact match (not prefix) to avoid matching
-				// "@fn BundleService.GetDocumentPageReadOnly" when renaming
-				// "BundleService.GetDocumentPage"
-				if trimmed == "@fn "+oldTarget || trimmed == "@type "+oldTarget {
-					edits = append(edits, Edit{
-						File:    aidFile,
-						Line:    i + 1,
-						OldText: oldTarget,
-						NewText: newTarget,
-						Kind:    AidUpdate,
-					})
-				} else if trimmed == "@fn "+oldBaseName || trimmed == "@type "+oldBaseName {
-					// Unqualified form: "@fn Close"
-					edits = append(edits, Edit{
-						File:    aidFile,
-						Line:    i + 1,
-						OldText: oldBaseName,
-						NewText: newBaseName,
-						Kind:    AidUpdate,
-					})
-				}
-
-				// Update @calls/@related/@sig references
-				if strings.HasPrefix(trimmed, "@sig") ||
-					strings.HasPrefix(trimmed, "@related") ||
-					strings.HasPrefix(trimmed, "@calls") {
-					// Only replace the full qualified name to avoid changing
-					// other types' methods (e.g., WriteAheadLog.Close when
-					// renaming WALManager.Close)
-					if strings.Contains(line, oldTarget) {
-						edits = append(edits, Edit{
-							File:    aidFile,
-							Line:    i + 1,
-							OldText: oldTarget,
-							NewText: newTarget,
-							Kind:    AidUpdate,
-						})
-					} else if !strings.Contains(oldTarget, ".") && strings.Contains(line, oldBaseName) {
-						// Only use basename fallback for non-method renames
-						// (methods must match the full qualified name)
-						edits = append(edits, Edit{
-							File:    aidFile,
-							Line:    i + 1,
-							OldText: oldBaseName,
-							NewText: newBaseName,
-							Kind:    AidUpdate,
-						})
-					}
-				}
+			original, err := os.ReadFile(aidPath)
+			if err != nil {
+				continue
 			}
+
+			modified := renameInAidFile(af, oldTarget, newTarget, oldBaseName, newBaseName, isMethod)
+			if !modified {
+				continue
+			}
+
+			newContent := emitter.Emit(af)
+			edits = append(edits, Edit{
+				File:    aidPath,
+				Line:    0, // Sentinel: whole-file replacement
+				OldText: string(original),
+				NewText: newContent,
+				Kind:    WholeFile,
+			})
 		}
 	}
 
 	return edits
+}
+
+// renameInAidFile modifies entry names and field references in a parsed
+// AID file. Returns true if any modification was made.
+func renameInAidFile(af *parser.AidFile, oldTarget, newTarget, oldBase, newBase string, isMethod bool) bool {
+	modified := false
+
+	for i, entry := range af.Entries {
+		// Update entry names: "@fn WALManager.Close" → "@fn WALManager.Shutdown"
+		if entry.Name == oldTarget {
+			af.Entries[i].Name = newTarget
+			modified = true
+		} else if !isMethod && entry.Name == oldBase {
+			af.Entries[i].Name = newBase
+			modified = true
+		}
+
+		// Update field references (@calls, @related, @sig, etc.)
+		for fieldName, field := range entry.Fields {
+			updatedField, changed := renameInField(field, oldTarget, newTarget, oldBase, newBase, isMethod)
+			if changed {
+				af.Entries[i].Fields[fieldName] = updatedField
+				modified = true
+			}
+		}
+	}
+
+	// Also update references in annotations (invariants, decisions, etc.)
+	for i, ann := range af.Annotations {
+		for fieldName, field := range ann.Fields {
+			updatedField, changed := renameInField(field, oldTarget, newTarget, oldBase, newBase, isMethod)
+			if changed {
+				af.Annotations[i].Fields[fieldName] = updatedField
+				modified = true
+			}
+		}
+	}
+
+	return modified
+}
+
+// renameInField replaces symbol references in a field's inline value
+// and continuation lines. Returns the updated field and whether any
+// change was made.
+func renameInField(field parser.Field, oldTarget, newTarget, oldBase, newBase string, isMethod bool) (parser.Field, bool) {
+	changed := false
+
+	// Replace in inline value
+	if strings.Contains(field.InlineValue, oldTarget) {
+		field.InlineValue = strings.ReplaceAll(field.InlineValue, oldTarget, newTarget)
+		changed = true
+	} else if !isMethod && strings.Contains(field.InlineValue, oldBase) {
+		field.InlineValue = strings.ReplaceAll(field.InlineValue, oldBase, newBase)
+		changed = true
+	}
+
+	// Replace in continuation lines
+	for j, line := range field.Lines {
+		if strings.Contains(line, oldTarget) {
+			field.Lines[j] = strings.ReplaceAll(line, oldTarget, newTarget)
+			changed = true
+		} else if !isMethod && strings.Contains(line, oldBase) {
+			field.Lines[j] = strings.ReplaceAll(line, oldBase, newBase)
+			changed = true
+		}
+	}
+
+	return field, changed
 }
 
 // ScopeMatch checks if a symbol occurrence on a line is in a context that should be renamed.
